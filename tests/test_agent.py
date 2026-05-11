@@ -6360,6 +6360,7 @@ def test_binary_content_serializable():
                 'run_id': IsStr(),
                 'conversation_id': IsStr(),
                 'metadata': None,
+                'state': 'complete',
             },
             {
                 'parts': [
@@ -6433,6 +6434,7 @@ def test_image_url_serializable_missing_media_type():
                 'run_id': IsStr(),
                 'conversation_id': IsStr(),
                 'metadata': None,
+                'state': 'complete',
             },
             {
                 'parts': [
@@ -6513,6 +6515,7 @@ def test_image_url_serializable():
                 'run_id': IsStr(),
                 'conversation_id': IsStr(),
                 'metadata': None,
+                'state': 'complete',
             },
             {
                 'parts': [
@@ -7290,6 +7293,7 @@ def test_tool_call_with_validation_value_error_serializable():
             'run_id': IsStr(),
             'conversation_id': IsStr(),
             'metadata': None,
+            'state': 'complete',
         }
     )
 
