@@ -5678,8 +5678,8 @@ class TestMultipleToolCalls:
         assert isinstance(result.output, OutputType)
         assert result.output.value == 'valid'
 
-    def test_exhaustive_strategy_runs_function_tools_around_output_in_emission_order(self):
-        """Function tools surrounding an output tool execute in the order the model emitted them."""
+    def test_exhaustive_strategy_function_tool_returns_preserve_emission_order_around_output(self):
+        """Function tool returns appear in the response message in emission order, even though execution is parallel."""
         execution_order: list[str] = []
 
         def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -5701,8 +5701,8 @@ class TestMultipleToolCalls:
 
         result = agent.run_sync('test')
 
-        # The output tool runs in line with its emission position.
-        assert execution_order == ['before', 'after']
+        # Both function tools execute in parallel — order is not guaranteed.
+        assert sorted(execution_order) == ['after', 'before']
         assert isinstance(result.output, OutputType)
         assert result.output.value == 'done'
 

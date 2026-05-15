@@ -389,10 +389,6 @@ async def test_complex_agent_run_in_workflow(allow_model_requests: None, dbos: D
                         ),
                         BasicSpan(content='running tool: get_country'),
                         BasicSpan(
-                            content='running tool: get_product_name',
-                            children=[BasicSpan(content='complex_agent__mcp_server__mcp.call_tool')],
-                        ),
-                        BasicSpan(
                             content='event_stream_handler',
                             children=[
                                 BasicSpan(content='ctx.run_step=1'),
@@ -400,6 +396,10 @@ async def test_complex_agent_run_in_workflow(allow_model_requests: None, dbos: D
                                     content='{"part": {"tool_name": "get_country", "content": "Mexico", "tool_call_id": null, "tool_kind": null, "metadata": null, "timestamp": null, "outcome": "success", "part_kind": "tool-return"}, "content": null, "event_kind": "function_tool_result"}'
                                 ),
                             ],
+                        ),
+                        BasicSpan(
+                            content='running tool: get_product_name',
+                            children=[BasicSpan(content='complex_agent__mcp_server__mcp.call_tool')],
                         ),
                         BasicSpan(
                             content='event_stream_handler',
@@ -692,8 +692,8 @@ async def test_complex_agent_run_sequential_tool(allow_model_requests: None, dbo
             'seq_complex_agent__model.request_stream',
             'event_stream_handler',
             'event_stream_handler',
-            'seq_complex_agent__mcp_server__mcp.call_tool',
             'event_stream_handler',
+            'seq_complex_agent__mcp_server__mcp.call_tool',
             'event_stream_handler',
             'seq_complex_agent__model.request_stream',
             'event_stream_handler',
