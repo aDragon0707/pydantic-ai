@@ -718,7 +718,18 @@ class ToolDefinition:
     """
 
     sequential: bool = False
-    """Whether this tool requires a sequential/serial execution environment."""
+    """Whether this tool requires a sequential/serial execution environment.
+
+    When `True`, this tool acts as a barrier within the step: tools the model emitted before
+    it (in emission order) complete fully before it runs, it runs alone, and tools emitted
+    after it start only after it finishes. Other tools without `sequential=True` can still
+    run in parallel with each other; the barrier only constrains overlap with the sequential
+    tool itself.
+
+    !!! warning "Behavior change in v2"
+        In v1, `sequential=True` on any tool forced the whole batch to run serially. In v2 it
+        is a per-tool barrier; other tools around it still parallelize.
+    """
 
     kind: ToolKind = field(default='function')
     """The kind of tool:

@@ -1089,6 +1089,11 @@ async def test_tool_manager_multiple_failed_tools():
 
 
 async def test_tool_manager_sequential_tool_call():
+    """In v2, `sequential=True` on a tool acts as a barrier in `process_tool_calls` (a
+    per-tool serialization point), not a switch that forces the whole batch to run
+    sequentially. `get_parallel_execution_mode` now reflects only the context-variable
+    setting; per-tool `sequential` is enforced via segmentation around barriers.
+    """
     toolset = FunctionToolset[None]()
 
     @toolset.tool_plain(sequential=True)
@@ -1101,27 +1106,23 @@ async def test_tool_manager_sequential_tool_call():
 
     prepared_tool_manager = await tool_manager.for_run_step(build_run_context(None))
 
+    # Default execution mode is 'parallel'; per-tool `sequential` doesn't change that
+    # at the `get_parallel_execution_mode` level any more.
     assert (
         prepared_tool_manager.get_parallel_execution_mode([ToolCallPart(tool_name='tool_a', args={'x': 1})])
-        == 'sequential'
+        == 'parallel'
     )
     assert (
-        not prepared_tool_manager.get_parallel_execution_mode([ToolCallPart(tool_name='tool_b', args={'x': 1})])
-        == 'sequential'
+        prepared_tool_manager.get_parallel_execution_mode([ToolCallPart(tool_name='tool_b', args={'x': 1})])
+        == 'parallel'
     )
 
-    assert (
-        prepared_tool_manager.get_parallel_execution_mode(
-            [ToolCallPart(tool_name='tool_a', args={'x': 1}), ToolCallPart(tool_name='tool_b', args={'x': 1})]
+    # The context-var override still flows through.
+    with prepared_tool_manager.parallel_execution_mode('sequential'):
+        assert (
+            prepared_tool_manager.get_parallel_execution_mode([ToolCallPart(tool_name='tool_b', args={'x': 1})])
+            == 'sequential'
         )
-        == 'sequential'
-    )
-    assert (
-        prepared_tool_manager.get_parallel_execution_mode(
-            [ToolCallPart(tool_name='tool_b', args={'x': 1}), ToolCallPart(tool_name='tool_a', args={'x': 1})]
-        )
-        == 'sequential'
-    )
 
 
 async def test_visit_and_replace():

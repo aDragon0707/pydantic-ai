@@ -121,6 +121,15 @@ class ToolOutput(Generic[OutputDataT]):
     """
     strict: bool | None
     """Whether to use strict mode for the tool."""
+    sequential: bool
+    """Whether this output tool requires a sequential/serial execution environment.
+
+    When `True`, this output tool acts as a barrier within the step: tools the model emitted
+    before it (in emission order) complete fully before it runs, it runs alone, and tools
+    emitted after it start only after it finishes. Other tools without `sequential=True`
+    can still run in parallel with each other; the barrier only constrains overlap with
+    the sequential tool itself.
+    """
 
     def __init__(
         self,
@@ -130,12 +139,14 @@ class ToolOutput(Generic[OutputDataT]):
         description: str | None = None,
         max_retries: int | None = None,
         strict: bool | None = None,
+        sequential: bool = False,
     ):
         self.output = type_
         self.name = name
         self.description = description
         self.max_retries = max_retries
         self.strict = strict
+        self.sequential = sequential
 
 
 @dataclass(init=False)

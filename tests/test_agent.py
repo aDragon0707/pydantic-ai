@@ -61,18 +61,25 @@ from pydantic_ai._output import (
     TextOutput,
 )
 from pydantic_ai.agent import AgentRunResult, WrapperAgent
+from pydantic_ai.capabilities import (
+    AbstractCapability,
+    NativeTool,
+    PrepareOutputTools,
+    PrepareTools,
+    ProcessEventStream,
+    WrapRunHandler,
+)
+from pydantic_ai.exceptions import ContentFilterError
+from pydantic_ai.messages import ModelResponseStreamEvent
+from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.test import TestModel
 from pydantic_ai.native_tools import (
     CodeExecutionTool,
     MCPServerTool,
     WebSearchTool,
     WebSearchUserLocation,
 )
-from pydantic_ai.capabilities import AbstractCapability, WrapRunHandler
-from pydantic_ai.exceptions import ContentFilterError
-from pydantic_ai.messages import ModelResponseStreamEvent
-from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse
-from pydantic_ai.models.function import AgentInfo, FunctionModel
-from pydantic_ai.models.test import TestModel
 from pydantic_ai.output import OutputObjectDefinition, StructuredDict, ToolOutput
 from pydantic_ai.providers import Provider
 from pydantic_ai.result import RunUsage
@@ -2921,7 +2928,7 @@ def test_run_with_history_new():
     assert result2.new_messages() == result2.all_messages()[-2:]
     assert result2.output == snapshot('{"ret_a":"a-apple"}')
     assert result2._output_tool_name == snapshot(None)  # pyright: ignore[reportPrivateUsage]
-    assert result2.usage() == snapshot(RunUsage(requests=1, input_tokens=55, output_tokens=13))
+    assert result2.usage == snapshot(RunUsage(requests=1, input_tokens=55, output_tokens=13))
     new_msg_part_kinds = [(m.kind, [p.part_kind for p in m.parts]) for m in result2.all_messages()]
     assert new_msg_part_kinds == snapshot(
         [
@@ -2995,8 +3002,8 @@ def test_run_with_history_new():
     assert result3.new_messages() == result3.all_messages()[-2:]
     assert result3.output == snapshot('{"ret_a":"a-apple"}')
     assert result3._output_tool_name == snapshot(None)  # pyright: ignore[reportPrivateUsage]
-    assert result3.usage() == snapshot(RunUsage(requests=1, input_tokens=55, output_tokens=13))
-    assert result3.timestamp() == IsNow(tz=timezone.utc)
+    assert result3.usage == snapshot(RunUsage(requests=1, input_tokens=55, output_tokens=13))
+    assert result3.timestamp == IsNow(tz=timezone.utc)
 
 
 def test_run_with_history_new_structured():
@@ -3157,7 +3164,7 @@ def test_run_with_history_new_structured():
     assert result2.output == snapshot(Response(a=0))
     assert result2.new_messages() == result2.all_messages()[-3:]
     assert result2._output_tool_name == snapshot('final_result')  # pyright: ignore[reportPrivateUsage]
-    assert result2.usage() == snapshot(RunUsage(requests=1, input_tokens=59, output_tokens=13))
+    assert result2.usage == snapshot(RunUsage(requests=1, input_tokens=59, output_tokens=13))
     new_msg_part_kinds = [(m.kind, [p.part_kind for p in m.parts]) for m in result2.all_messages()]
     assert new_msg_part_kinds == snapshot(
         [
@@ -3980,7 +3987,7 @@ def test_thinking_only_response_with_finish_reason_length():
 def test_model_requests_blocked(env: TestEnv):
     try:
         env.set('GEMINI_API_KEY', 'foobar')
-        agent = Agent('google-gla:gemini-3-flash-preview', output_type=tuple[str, str], defer_model_check=True)
+        agent = Agent('google:gemini-3-flash-preview', output_type=tuple[str, str], defer_model_check=True)
 
         with pytest.raises(RuntimeError, match='Model requests are not allowed, since ALLOW_MODEL_REQUESTS is False'):
             agent.run_sync('Hello')
@@ -4194,7 +4201,12 @@ class TestMultipleToolCalls:
         )
 
     def test_early_strategy_does_not_call_additional_output_tools(self):
-        """Test that 'early' strategy does not execute additional output tool functions."""
+        """Test that 'early' strategy uses the first-emission-order output tool's result.
+
+        Under Option C parallel execution, additional output tool processors may still run
+        (they were launched in parallel), but their results are discarded — "first valid
+        output wins" by emission order.
+        """
         output_tools_called: list[str] = []
 
         def process_first(output: OutputType) -> OutputType:
@@ -4202,7 +4214,7 @@ class TestMultipleToolCalls:
             output_tools_called.append('first')
             return output
 
-        def process_second(output: OutputType) -> OutputType:  # pragma: no cover
+        def process_second(output: OutputType) -> OutputType:
             """Process second output."""
             output_tools_called.append('second')
             return output
@@ -4227,12 +4239,9 @@ class TestMultipleToolCalls:
 
         result = agent.run_sync('test early output tools')
 
-        # Verify the result came from the first output tool
+        # Verify the result came from the first-emission-order output tool.
         assert isinstance(result.output, OutputType)
         assert result.output.value == 'first'
-
-        # Verify only the first output tool was called
-        assert output_tools_called == ['first']
 
         # Verify we got tool returns in the correct order
         assert result.all_messages() == snapshot(
@@ -4338,8 +4347,12 @@ class TestMultipleToolCalls:
         )
 
     def test_early_strategy_with_final_result_in_middle(self):
-        """Test that 'early' strategy runs tools before the final result and skips tools after."""
-        tool_called: list[str] = []
+        """Test that 'early' strategy cancels pending function tools once the output succeeds.
+
+        Under Option C parallel execution, the `final_result` output tool may complete
+        before sync function tools that were emitted around it; pending tasks are
+        cancelled when the first-emission-order output succeeds.
+        """
 
         def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
             assert info.output_tools is not None
@@ -4355,15 +4368,11 @@ class TestMultipleToolCalls:
         agent = Agent(FunctionModel(return_model), output_type=OutputType, end_strategy='early')
 
         @agent.tool_plain
-        def regular_tool(x: int) -> int:
-            """A regular tool that runs before the final result."""
-            tool_called.append('regular_tool')
+        def regular_tool(x: int) -> int:  # pragma: lax no cover  # may be cancelled before being invoked
             return x
 
         @agent.tool_plain
-        def another_tool(y: int) -> int:  # pragma: no cover
-            """A tool that should not be called."""
-            tool_called.append('another_tool')
+        def another_tool(y: int) -> int:  # pragma: lax no cover  # may be cancelled before being invoked
             return y
 
         async def defer(ctx: RunContext[None], tool_def: ToolDefinition) -> ToolDefinition | None:
@@ -4375,72 +4384,21 @@ class TestMultipleToolCalls:
 
         result = agent.run_sync('test early strategy with final result in middle')
 
-        # Tools before the final result run; tools after are skipped.
-        assert tool_called == ['regular_tool']
+        # The output's `final_result` won; pending function and deferred tools were skipped.
+        assert isinstance(result.output, OutputType)
+        assert result.output.value == 'final'
 
-        # Verify we got appropriate tool returns
-        assert result.all_messages() == snapshot(
-            [
-                ModelRequest(
-                    parts=[
-                        UserPromptPart(
-                            content='test early strategy with final result in middle', timestamp=IsNow(tz=timezone.utc)
-                        )
-                    ],
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-                ModelResponse(
-                    parts=[
-                        ToolCallPart(tool_name='regular_tool', args={'x': 1}, tool_call_id=IsStr()),
-                        ToolCallPart(tool_name='final_result', args={'value': 'final'}, tool_call_id=IsStr()),
-                        ToolCallPart(tool_name='another_tool', args={'y': 2}, tool_call_id=IsStr()),
-                        ToolCallPart(
-                            tool_name='deferred_tool',
-                            args={'x': 5},
-                            tool_call_id=IsStr(),
-                        ),
-                    ],
-                    usage=RequestUsage(input_tokens=58, output_tokens=17),
-                    model_name='function:return_model:',
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-                ModelRequest(
-                    parts=[
-                        ToolReturnPart(
-                            tool_name='regular_tool',
-                            content=1,
-                            tool_call_id=IsStr(),
-                            timestamp=IsNow(tz=timezone.utc),
-                        ),
-                        ToolReturnPart(
-                            tool_name='final_result',
-                            content='Final result processed.',
-                            tool_call_id=IsStr(),
-                            timestamp=IsNow(tz=timezone.utc),
-                        ),
-                        ToolReturnPart(
-                            tool_name='another_tool',
-                            content='Tool not executed - a final result was already processed.',
-                            tool_call_id=IsStr(),
-                            timestamp=IsNow(tz=timezone.utc),
-                        ),
-                        ToolReturnPart(
-                            tool_name='deferred_tool',
-                            content='Tool not executed - a final result was already processed.',
-                            tool_call_id=IsStr(),
-                            timestamp=IsNow(tz=timezone.utc),
-                        ),
-                    ],
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-            ]
-        )
+        last_request = result.all_messages()[-1]
+        assert isinstance(last_request, ModelRequest)
+        return_parts = [part for part in last_request.parts if isinstance(part, ToolReturnPart)]
+        # The final_result tool's return part records success; pending tools (regular_tool,
+        # another_tool, deferred_tool) are stubbed as "not executed". The function tools may
+        # also have completed in time (race with the output tool); either way the message
+        # history contains exactly one part per call.
+        assert {p.tool_name for p in return_parts} == {'regular_tool', 'final_result', 'another_tool', 'deferred_tool'}
+        final_result_parts = [p for p in return_parts if p.tool_name == 'final_result']
+        assert len(final_result_parts) == 1
+        assert final_result_parts[0].content == 'Final result processed.'
 
     def test_early_strategy_with_external_tool_call(self):
         """Test that early strategy handles external tool calls correctly.
@@ -4804,16 +4762,16 @@ class TestMultipleToolCalls:
         )
 
     def test_graceful_strategy_does_not_call_additional_output_tools(self):
-        """Test that 'graceful' strategy does not execute additional output tool functions."""
+        """Under `graceful` with Option C parallel execution, both output tool processors
+        run (in parallel); the first-emission-order valid output wins, and subsequent
+        successful outputs are recorded as "skipped" in message history."""
         output_tools_called: list[str] = []
 
         def process_first(output: OutputType) -> OutputType:
-            """Process first output."""
             output_tools_called.append('first')
             return output
 
-        def process_second(output: OutputType) -> OutputType:  # pragma: no cover
-            """Process second output."""
+        def process_second(output: OutputType) -> OutputType:
             output_tools_called.append('second')
             return output
 
@@ -4837,54 +4795,18 @@ class TestMultipleToolCalls:
 
         result = agent.run_sync('test graceful output tools')
 
-        # Verify the result came from the first output tool
+        # The first output tool's result wins; both processors ran in parallel.
         assert isinstance(result.output, OutputType)
         assert result.output.value == 'first'
+        assert output_tools_called == ['first', 'second']
 
-        # Verify only the first output tool was called
-        assert output_tools_called == ['first']
-
-        # Verify we got tool returns in the correct order
-        assert result.all_messages() == snapshot(
-            [
-                ModelRequest(
-                    parts=[UserPromptPart(content='test graceful output tools', timestamp=IsNow(tz=timezone.utc))],
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-                ModelResponse(
-                    parts=[
-                        ToolCallPart(tool_name='first_output', args={'value': 'first'}, tool_call_id=IsStr()),
-                        ToolCallPart(tool_name='second_output', args={'value': 'second'}, tool_call_id=IsStr()),
-                    ],
-                    usage=RequestUsage(input_tokens=54, output_tokens=10),
-                    model_name='function:return_model:',
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-                ModelRequest(
-                    parts=[
-                        ToolReturnPart(
-                            tool_name='first_output',
-                            content='Final result processed.',
-                            tool_call_id=IsStr(),
-                            timestamp=IsNow(tz=timezone.utc),
-                        ),
-                        ToolReturnPart(
-                            tool_name='second_output',
-                            content='Output tool not used - a final result was already processed.',
-                            tool_call_id=IsStr(),
-                            timestamp=IsNow(tz=timezone.utc),
-                        ),
-                    ],
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-            ]
-        )
+        # Verify message-history bookkeeping reflects the skipped second output.
+        last_request = result.all_messages()[-1]
+        assert isinstance(last_request, ModelRequest)
+        assert [(part.tool_name, part.content) for part in last_request.parts if isinstance(part, ToolReturnPart)] == [
+            ('first_output', 'Final result processed.'),
+            ('second_output', 'Output tool not used - a final result was already processed.'),
+        ]
 
     def test_graceful_strategy_uses_first_final_result(self):
         """Test that 'graceful' strategy uses the first final result and ignores subsequent ones."""
@@ -5153,7 +5075,7 @@ class TestMultipleToolCalls:
                         ),
                         ToolReturnPart(
                             tool_name='final_result',
-                            content='Final result processed.',
+                            content='Output tool processed, but its value will not be the final result of the agent run.',
                             tool_call_id=IsStr(),
                             timestamp=IsNow(tz=timezone.utc),
                         ),
@@ -5242,7 +5164,7 @@ class TestMultipleToolCalls:
                         ),
                         ToolReturnPart(
                             tool_name='second_output',
-                            content='Final result processed.',
+                            content='Output tool processed, but its value will not be the final result of the agent run.',
                             tool_call_id=IsStr(),
                             timestamp=IsNow(tz=timezone.utc),
                         ),
@@ -5257,38 +5179,30 @@ class TestMultipleToolCalls:
     def test_exhaustive_strategy_invalid_first_valid_second_output(self):
         """Test exhaustive when the first output retries and the second succeeds in the same batch.
 
-        Retry-wins: the first output's `ModelRetry` suppresses the second output's
-        success and surfaces the retry to the model on the next round. The second
-        output's `ToolReturnPart` is rewritten to explain the suppression.
+        Output-tool retries do not trigger retry-wins (the "first valid output wins"
+        invariant is order-independent for output tools). The second output's success
+        becomes the final result; the first output's retry surfaces to message history.
         """
         output_tools_called: list[str] = []
-        call_count = 0
 
         def process_first(output: OutputType) -> OutputType:
-            """Process first output - retries on the first attempt, succeeds on the second."""
             output_tools_called.append('first')
             if output.value == 'invalid':
                 raise ModelRetry('First output validation failed')
-            return output
+            return output  # pragma: no cover
 
         def process_second(output: OutputType) -> OutputType:
-            """Process second output - always valid."""
             output_tools_called.append('second')
             return output
 
         def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            nonlocal call_count
-            call_count += 1
             assert info.output_tools is not None
-            if call_count == 1:
-                return ModelResponse(
-                    parts=[
-                        ToolCallPart('first_output', {'value': 'invalid'}),
-                        ToolCallPart('second_output', {'value': 'valid'}),
-                    ],
-                )
-            # Retry round: model corrects first_output and stops calling second_output.
-            return ModelResponse(parts=[ToolCallPart('first_output', {'value': 'corrected'})])
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('first_output', {'value': 'invalid'}),
+                    ToolCallPart('second_output', {'value': 'valid'}),
+                ],
+            )
 
         agent = Agent(
             FunctionModel(return_model),
@@ -5301,79 +5215,23 @@ class TestMultipleToolCalls:
 
         result = agent.run_sync('test invalid first valid second')
 
-        # The retry-wins round corrected the first output; that's the final result.
+        # The second output succeeded; its result is final. The first output's retry is
+        # surfaced to message history but doesn't trigger retry-wins.
         assert isinstance(result.output, OutputType)
-        assert result.output.value == 'corrected'
+        assert result.output.value == 'valid'
+        assert output_tools_called == ['first', 'second']
 
-        # Both output tools fired in the first round; only the corrected first_output
-        # ran in the retry round.
-        assert output_tools_called == ['first', 'second', 'first']
-
-        # First round: retry from first_output suppresses second_output's success;
-        # the second_output's `ToolReturnPart` is rewritten accordingly.
-        assert result.all_messages() == snapshot(
-            [
-                ModelRequest(
-                    parts=[UserPromptPart(content='test invalid first valid second', timestamp=IsNow(tz=timezone.utc))],
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-                ModelResponse(
-                    parts=[
-                        ToolCallPart(tool_name='first_output', args={'value': 'invalid'}, tool_call_id=IsStr()),
-                        ToolCallPart(tool_name='second_output', args={'value': 'valid'}, tool_call_id=IsStr()),
-                    ],
-                    usage=RequestUsage(input_tokens=55, output_tokens=10),
-                    model_name='function:return_model:',
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-                ModelRequest(
-                    parts=[
-                        RetryPromptPart(
-                            content='First output validation failed',
-                            tool_name='first_output',
-                            tool_call_id=IsStr(),
-                            timestamp=IsNow(tz=timezone.utc),
-                        ),
-                        ToolReturnPart(
-                            tool_name='second_output',
-                            content='Output tool returned a value but it was not used as the final result because another tool in the same step requires a retry.',
-                            tool_call_id=IsStr(),
-                            timestamp=IsNow(tz=timezone.utc),
-                        ),
-                    ],
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-                ModelResponse(
-                    parts=[
-                        ToolCallPart(tool_name='first_output', args={'value': 'corrected'}, tool_call_id=IsStr()),
-                    ],
-                    usage=RequestUsage(input_tokens=91, output_tokens=15),
-                    model_name='function:return_model:',
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-                ModelRequest(
-                    parts=[
-                        ToolReturnPart(
-                            tool_name='first_output',
-                            content='Final result processed.',
-                            tool_call_id=IsStr(),
-                            timestamp=IsNow(tz=timezone.utc),
-                        ),
-                    ],
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-            ]
-        )
+        last_request = result.all_messages()[-1]
+        assert isinstance(last_request, ModelRequest)
+        # The retry from `first_output` is preserved in message history; `second_output`
+        # records the "Final result processed." status part.
+        retry_parts = [part for part in last_request.parts if isinstance(part, RetryPromptPart)]
+        return_parts = [part for part in last_request.parts if isinstance(part, ToolReturnPart)]
+        assert len(retry_parts) == 1
+        assert retry_parts[0].tool_name == 'first_output'
+        assert [(p.tool_name, p.content) for p in return_parts] == [
+            ('second_output', 'Final result processed.'),
+        ]
 
     def test_exhaustive_strategy_valid_first_invalid_second_output(self):
         """Test that exhaustive strategy uses the first valid output even when the second is invalid."""
@@ -5648,30 +5506,24 @@ class TestMultipleToolCalls:
         assert result.output.value == 'valid'
 
     def test_multiple_final_result_are_validated_correctly(self):
-        """Tests that when multiple final results are returned and one fails validation,
-        retry-wins suppresses the other's success and surfaces the validation error
-        to the model on the next round."""
-        call_count = 0
+        """Tests that when multiple final results are returned and one fails validation
+        while another succeeds, "first valid output wins" — the successful one's result
+        is final and the failed one's retry is surfaced to message history."""
 
         def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            nonlocal call_count
-            call_count += 1
             assert info.output_tools is not None
-            if call_count == 1:
-                return ModelResponse(
-                    parts=[
-                        ToolCallPart('final_result', {'bad_value': 'first'}, tool_call_id='first'),
-                        ToolCallPart('final_result', {'value': 'second'}, tool_call_id='second'),
-                    ],
-                )
-            # Retry round: model corrects the first call's args.
-            return ModelResponse(parts=[ToolCallPart('final_result', {'value': 'corrected'}, tool_call_id='retry')])
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('final_result', {'bad_value': 'first'}, tool_call_id='first'),
+                    ToolCallPart('final_result', {'value': 'second'}, tool_call_id='second'),
+                ],
+            )
 
         agent = Agent(FunctionModel(return_model), output_type=OutputType, end_strategy='early')
         result = agent.run_sync('test multiple final results')
 
-        # The corrected retry is the final result.
-        assert result.output.value == 'corrected'
+        # The second valid output wins; output-tool retries don't trigger retry-wins.
+        assert result.output.value == 'second'
 
         # Verify we got appropriate tool returns
         assert result.new_messages() == snapshot(
@@ -5710,32 +5562,9 @@ class TestMultipleToolCalls:
                         ),
                         ToolReturnPart(
                             tool_name='final_result',
-                            content='Output tool returned a value but it was not used as the final result because another tool in the same step requires a retry.',
-                            timestamp=IsNow(tz=timezone.utc),
-                            tool_call_id='second',
-                        ),
-                    ],
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-                ModelResponse(
-                    parts=[
-                        ToolCallPart(tool_name='final_result', args={'value': 'corrected'}, tool_call_id='retry'),
-                    ],
-                    usage=RequestUsage(input_tokens=109, output_tokens=15),
-                    model_name='function:return_model:',
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-                ModelRequest(
-                    parts=[
-                        ToolReturnPart(
-                            tool_name='final_result',
                             content='Final result processed.',
                             timestamp=IsNow(tz=timezone.utc),
-                            tool_call_id='retry',
+                            tool_call_id='second',
                         ),
                     ],
                     timestamp=IsNow(tz=timezone.utc),
@@ -5938,10 +5767,7 @@ class TestMultipleToolCalls:
             if isinstance(part, ToolReturnPart) and part.tool_name == 'final_result'
         ]
         assert len(suppressed_returns) == 1
-        assert suppressed_returns[0].content == (
-            'Output tool returned a value but it was not used as the final result '
-            'because another tool in the same step requires a retry.'
-        )
+        assert suppressed_returns[0].content == 'Output not used as the final result.'
         # The retry from `edit` is also present.
         assert any(isinstance(part, RetryPromptPart) and part.tool_name == 'edit' for part in first_round_request.parts)
 
@@ -5982,43 +5808,141 @@ class TestMultipleToolCalls:
         assert result.output.value == 'finished'
         assert call_count == 2
 
-    def test_early_retry_wins_when_function_tool_before_output_retries(self):
-        """Retry-wins fires under `early` when a function tool emitted before the output
-        tool raises `ModelRetry`. The output tool still runs (it executes in emission order),
-        but its `final_result` is suppressed and the retry surfaces to the model."""
-        call_count = 0
+    def test_early_strategy_cancels_pending_function_tools_when_output_succeeds(self):
+        """Under `early` with parallel execution, a function tool emitted alongside an
+        output tool may get cancelled when the output tool completes first; its retry, if
+        any, doesn't fire because the task was cancelled before producing a result.
+
+        This is the trade-off of Option C: `early` is the lowest-latency strategy, at the
+        cost of potentially skipping function-tool retries. Use `graceful` or `exhaustive`
+        if function-tool retries need to be honored alongside output tools.
+        """
 
         def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-            nonlocal call_count
-            call_count += 1
             assert info.output_tools is not None
-            if call_count == 1:
-                return ModelResponse(
-                    parts=[
-                        ToolCallPart('edit', {'text': 'NONEXISTENT'}),
-                        ToolCallPart('final_result', {'value': 'finished'}),
-                    ],
-                )
             return ModelResponse(
                 parts=[
-                    ToolCallPart('edit', {'text': 'CORRECT'}),
+                    ToolCallPart('edit', {'text': 'NONEXISTENT'}),
                     ToolCallPart('final_result', {'value': 'finished'}),
-                ]
+                ],
             )
 
         agent = Agent(FunctionModel(return_model), output_type=OutputType, end_strategy='early')
 
         @agent.tool_plain
-        def edit(text: str) -> str:
+        def edit(
+            text: str,
+        ) -> str:  # pragma: lax no cover  # may be cancelled before being invoked under early-strategy parallelism
             if text == 'NONEXISTENT':
                 raise ModelRetry('Anchor not found.')
             return f'Edited: {text}'
 
         result = agent.run_sync('test')
 
+        # The output's `final_result` wins; the function tool's retry (if it managed to
+        # run before cancellation) doesn't trigger retry-wins because retry-wins fires
+        # only when a `RetryPromptPart` was added to `output_parts` from a completed task.
         assert isinstance(result.output, OutputType)
         assert result.output.value == 'finished'
-        assert call_count == 2
+
+    def test_function_tool_with_sequential_barrier(self):
+        """A function tool with `sequential=True` runs alone (no overlap) but tools
+        emitted before and after it can run in parallel groups around it."""
+        execution_log: list[str] = []
+        in_flight: list[str] = []
+        max_concurrent_around_barrier = 0
+
+        async def parallel_tool(name: str) -> str:
+            in_flight.append(name)
+            nonlocal max_concurrent_around_barrier
+            max_concurrent_around_barrier = max(max_concurrent_around_barrier, len(in_flight))
+            await asyncio.sleep(0.01)
+            execution_log.append(name)
+            in_flight.remove(name)
+            return name
+
+        async def barrier_tool() -> str:
+            # When this runs, no other tool task should be in-flight.
+            assert in_flight == [], f'Sequential tool overlapped with {in_flight}'
+            execution_log.append('barrier')
+            return 'barrier'
+
+        def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            assert info.output_tools is not None
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('parallel_tool', {'name': 'before_a'}),
+                    ToolCallPart('parallel_tool', {'name': 'before_b'}),
+                    ToolCallPart('barrier_tool'),
+                    ToolCallPart('parallel_tool', {'name': 'after_a'}),
+                    ToolCallPart('parallel_tool', {'name': 'after_b'}),
+                    ToolCallPart('final_result', {'value': 'done'}),
+                ],
+            )
+
+        agent = Agent(FunctionModel(return_model), output_type=OutputType, end_strategy='exhaustive')
+        agent.tool_plain(parallel_tool)
+        agent.tool_plain(sequential=True)(barrier_tool)
+
+        result = agent.run_sync('test sequential barrier')
+
+        # Before-group tools both ran before the barrier; after-group tools ran after.
+        before_idx = execution_log.index('barrier')
+        before = set(execution_log[:before_idx])
+        after = set(execution_log[before_idx + 1 :])
+        assert before == {'before_a', 'before_b'}
+        # 'after_a' / 'after_b' ran in the post-barrier segment, and 'final_result' is
+        # not in execution_log (no side-effect logging for the output tool).
+        assert {'after_a', 'after_b'} <= after
+        # Within each parallel segment, both tools overlapped (concurrent > 1).
+        assert max_concurrent_around_barrier >= 2
+        assert isinstance(result.output, OutputType)
+
+    def test_output_tool_with_sequential_barrier(self):
+        """An output tool with `sequential=True` runs alone; function tools emitted
+        before complete first, function tools emitted after start after the output."""
+        execution_log: list[str] = []
+        in_flight: list[str] = []
+
+        async def parallel_tool(name: str) -> str:
+            in_flight.append(name)
+            await asyncio.sleep(0.01)
+            execution_log.append(name)
+            in_flight.remove(name)
+            return name
+
+        def process_output(output: OutputType) -> OutputType:
+            assert in_flight == [], f'Sequential output overlapped with {in_flight}'
+            execution_log.append('final')
+            return output
+
+        def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            assert info.output_tools is not None
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('parallel_tool', {'name': 'before_a'}),
+                    ToolCallPart('parallel_tool', {'name': 'before_b'}),
+                    ToolCallPart('final_result', {'value': 'done'}),
+                    ToolCallPart('parallel_tool', {'name': 'after_a'}),
+                ],
+            )
+
+        agent = Agent(
+            FunctionModel(return_model),
+            output_type=ToolOutput(process_output, name='final_result', sequential=True),
+            end_strategy='exhaustive',
+        )
+        agent.tool_plain(parallel_tool)
+
+        result = agent.run_sync('test sequential output barrier')
+
+        before_idx = execution_log.index('final')
+        before = set(execution_log[:before_idx])
+        after = set(execution_log[before_idx + 1 :])
+        assert {'before_a', 'before_b'} <= before
+        assert {'after_a'} <= after
+        assert isinstance(result.output, OutputType)
+        assert result.output.value == 'done'
 
     # NOTE: When changing tests in this class:
     # 1. Follow the existing order
@@ -7220,7 +7144,7 @@ def test_agent_run_result_serialization() -> None:
 def test_agent_repr() -> None:
     agent = Agent()
     assert repr(agent) == snapshot(
-        "Agent(model=None, name=None, end_strategy='early', model_settings=None, output_type=<class 'str'>, instrument=None)"
+        "Agent(model=None, name=None, end_strategy='early', model_settings=None, output_type=<class 'str'>)"
     )
 
 
@@ -7797,7 +7721,7 @@ def test_override_toolsets():
         available_tools.append([tool_def.name for tool_def in tool_defs])
         return tool_defs
 
-    agent = Agent('test', toolsets=[foo_toolset], prepare_tools=prepare_tools)
+    agent = Agent('test', toolsets=[foo_toolset], capabilities=[PrepareTools(prepare_tools)])
 
     @agent.tool_plain
     def baz() -> str:
@@ -7847,7 +7771,7 @@ def test_override_tools():
         available_tools.append([tool_def.name for tool_def in tool_defs])
         return tool_defs
 
-    agent = Agent('test', tools=[foo], prepare_tools=prepare_tools)
+    agent = Agent('test', tools=[foo], capabilities=[PrepareTools(prepare_tools)])
 
     result = agent.run_sync('Hello')
     assert available_tools[-1] == snapshot(['foo'])
@@ -7893,7 +7817,7 @@ def test_toolset_factory():
         else:
             return ModelResponse(parts=[TextPart('Done')])
 
-    agent = Agent(FunctionModel(respond), toolsets=[via_toolsets_arg], prepare_tools=prepare_tools)
+    agent = Agent(FunctionModel(respond), toolsets=[via_toolsets_arg], capabilities=[PrepareTools(prepare_tools)])
 
     @agent.toolset
     def via_toolset_decorator(ctx: RunContext[None]) -> AbstractToolset[None]:
@@ -8033,7 +7957,7 @@ def test_prepare_output_tools():
         deps_type=AgentDeps,
         tools=[present_plan],
         output_type=[ToolOutput(run_sql, name='run_sql')],
-        prepare_output_tools=only_if_plan_presented,
+        capabilities=[PrepareOutputTools(only_if_plan_presented)],
     )
 
     result = agent.run_sync('Hello', deps=AgentDeps())
@@ -8137,7 +8061,7 @@ def test_prepare_output_tools_receives_output_max_retries():
         output_type=Foo,
         output_retries=target_retries,
         tool_retries=1,  # tool retry budget — different from output, must NOT leak into prep ctx
-        prepare_output_tools=prep,
+        capabilities=[PrepareOutputTools(prep)],
     )
 
     @agent.output_validator
@@ -8178,7 +8102,7 @@ def test_prepare_output_tools_sees_run_level_output_retries_override():
         FunctionModel(return_model),
         output_type=Foo,
         output_retries=5,
-        prepare_output_tools=prep,
+        capabilities=[PrepareOutputTools(prep)],
     )
 
     result = agent.run_sync('Hello', output_retries=2)
@@ -8569,7 +8493,7 @@ async def test_wrapper_agent():
         system_prompt='You are a wrapped agent',
         toolsets=[foo_toolset],
         output_type=Foo,
-        event_stream_handler=event_stream_handler,
+        capabilities=[ProcessEventStream(event_stream_handler)],
     )
     wrapper_agent = WrapperAgent(agent)
     assert [p.content for p in await wrapper_agent.system_prompt_parts()] == ['You are a wrapped agent']
@@ -9822,16 +9746,16 @@ def test_continue_conversation_that_ended_in_output_tool_call(allow_model_reques
 
 
 def test_agent_builtin_tools_runtime_vs_agent_level():
-    """Test that runtime builtin_tools parameter is merged with agent-level builtin_tools."""
+    """Test that runtime native tools are merged with agent-level native tools."""
     model = TestModel()
 
     agent = Agent(
         model=model,
-        builtin_tools=[
-            WebSearchTool(),
-            CodeExecutionTool(),
-            MCPServerTool(id='deepwiki', url='https://mcp.deepwiki.com/mcp'),
-            MCPServerTool(id='github', url='https://api.githubcopilot.com/mcp'),
+        capabilities=[
+            NativeTool(WebSearchTool()),
+            NativeTool(CodeExecutionTool()),
+            NativeTool(MCPServerTool(id='deepwiki', url='https://mcp.deepwiki.com/mcp')),
+            NativeTool(MCPServerTool(id='github', url='https://api.githubcopilot.com/mcp')),
         ],
     )
 
@@ -9839,15 +9763,17 @@ def test_agent_builtin_tools_runtime_vs_agent_level():
     with pytest.raises(Exception, match='TestModel does not support built-in tools'):
         agent.run_sync(
             'Hello',
-            builtin_tools=[
-                WebSearchTool(search_context_size='high'),
-                MCPServerTool(id='example', url='https://mcp.example.com/mcp'),
-                MCPServerTool(id='github', url='https://mcp.githubcopilot.com/mcp', authorization_token='token'),
+            capabilities=[
+                NativeTool(WebSearchTool(search_context_size='high')),
+                NativeTool(MCPServerTool(id='example', url='https://mcp.example.com/mcp')),
+                NativeTool(
+                    MCPServerTool(id='github', url='https://mcp.githubcopilot.com/mcp', authorization_token='token')
+                ),
             ],
         )
 
     assert model.last_model_request_parameters is not None
-    assert model.last_model_request_parameters.builtin_tools == snapshot(
+    assert model.last_model_request_parameters.native_tools == snapshot(
         [
             WebSearchTool(search_context_size='high'),
             CodeExecutionTool(),
@@ -9859,49 +9785,49 @@ def test_agent_builtin_tools_runtime_vs_agent_level():
 
 
 def test_agent_override_builtin_tools_empty_runs_with_test_model():
-    """Test that agent-level builtin tools can be removed when overriding the model."""
+    """Test that agent-level native tools can be removed when overriding the model."""
     model = TestModel()
-    agent = Agent(model=model, builtin_tools=[WebSearchTool()])
+    agent = Agent(model=model, capabilities=[NativeTool(WebSearchTool())])
 
-    with agent.override(model=model, builtin_tools=[]):
+    with agent.override(model=model, native_tools=[]):
         result = agent.run_sync('Hello')
 
     assert result.output == 'success (no tool calls)'
     assert model.last_model_request_parameters is not None
-    assert model.last_model_request_parameters.builtin_tools == []
+    assert model.last_model_request_parameters.native_tools == []
 
 
 def test_agent_override_builtin_tools_replaces_agent_level_tools():
-    """Test that override builtin_tools replace, rather than append to, agent-level builtin tools."""
+    """Test that override native_tools replace, rather than append to, agent-level native tools."""
     model = TestModel()
-    agent = Agent(model=model, builtin_tools=[WebSearchTool()])
+    agent = Agent(model=model, capabilities=[NativeTool(WebSearchTool())])
 
     with (
-        agent.override(builtin_tools=[CodeExecutionTool()]),
+        agent.override(native_tools=[CodeExecutionTool()]),
         pytest.raises(UserError, match='TestModel does not support built-in tools'),
     ):
         agent.run_sync('Hello')
 
     assert model.last_model_request_parameters is not None
-    assert model.last_model_request_parameters.builtin_tools == snapshot([CodeExecutionTool()])
+    assert model.last_model_request_parameters.native_tools == snapshot([CodeExecutionTool()])
 
 
 def test_agent_override_builtin_tools_preserves_runtime_additive_tools():
-    """Test that runtime builtin_tools are still added to overridden builtin tools."""
+    """Test that runtime native tools are still added to overridden native tools."""
     model = TestModel()
-    agent = Agent(model=model, builtin_tools=[WebSearchTool()])
+    agent = Agent(model=model, capabilities=[NativeTool(WebSearchTool())])
 
     with (
-        agent.override(builtin_tools=[CodeExecutionTool()]),
+        agent.override(native_tools=[CodeExecutionTool()]),
         pytest.raises(UserError, match='TestModel does not support built-in tools'),
     ):
         agent.run_sync(
             'Hello',
-            builtin_tools=[MCPServerTool(id='example', url='https://mcp.example.com/mcp')],
+            capabilities=[NativeTool(MCPServerTool(id='example', url='https://mcp.example.com/mcp'))],
         )
 
     assert model.last_model_request_parameters is not None
-    assert model.last_model_request_parameters.builtin_tools == snapshot(
+    assert model.last_model_request_parameters.native_tools == snapshot(
         [CodeExecutionTool(), MCPServerTool(id='example', url='https://mcp.example.com/mcp')]
     )
 
@@ -10001,7 +9927,7 @@ async def prepared_web_search(ctx: RunContext[UserContext]) -> WebSearchTool | N
 
 async def test_dynamic_builtin_tool_configured():
     model = TestModel()
-    agent = Agent(model, builtin_tools=[prepared_web_search], deps_type=UserContext)
+    agent = Agent(model, capabilities=[NativeTool(prepared_web_search)], deps_type=UserContext)
 
     user_context = UserContext(location='London')
 
@@ -10009,7 +9935,7 @@ async def test_dynamic_builtin_tool_configured():
         await agent.run('Hello', deps=user_context)
 
     assert model.last_model_request_parameters is not None
-    tools = model.last_model_request_parameters.builtin_tools
+    tools = model.last_model_request_parameters.native_tools
     assert len(tools) == 1
     tool = tools[0]
     assert isinstance(tool, WebSearchTool)
@@ -10020,14 +9946,14 @@ async def test_dynamic_builtin_tool_configured():
 
 async def test_dynamic_builtin_tool_omitted():
     model = TestModel()
-    agent = Agent(model, builtin_tools=[prepared_web_search], deps_type=UserContext)
+    agent = Agent(model, capabilities=[NativeTool(prepared_web_search)], deps_type=UserContext)
 
     user_context = UserContext(location=None)
 
     await agent.run('Hello', deps=user_context)
 
     assert model.last_model_request_parameters is not None
-    tools = model.last_model_request_parameters.builtin_tools
+    tools = model.last_model_request_parameters.native_tools
     assert len(tools) == 0
 
 
@@ -10035,14 +9961,18 @@ async def test_mixed_static_and_dynamic_builtin_tools():
     model = TestModel()
 
     static_tool = CodeExecutionTool()
-    agent = Agent(model, builtin_tools=[static_tool, prepared_web_search], deps_type=UserContext)
+    agent = Agent(
+        model,
+        capabilities=[NativeTool(static_tool), NativeTool(prepared_web_search)],
+        deps_type=UserContext,
+    )
 
     # Case 1: Dynamic tool returns None
     with pytest.raises(UserError, match='TestModel does not support built-in tools'):
         await agent.run('Hello', deps=UserContext(location=None))
 
     assert model.last_model_request_parameters is not None
-    tools = model.last_model_request_parameters.builtin_tools
+    tools = model.last_model_request_parameters.native_tools
     assert len(tools) == 1
     assert tools[0] == static_tool
 
@@ -10051,7 +9981,7 @@ async def test_mixed_static_and_dynamic_builtin_tools():
         await agent.run('Hello', deps=UserContext(location='Paris'))
 
     assert model.last_model_request_parameters is not None
-    tools = model.last_model_request_parameters.builtin_tools
+    tools = model.last_model_request_parameters.native_tools
     assert len(tools) == 2
     assert tools[0] == static_tool
     dynamic_tool = tools[1]
@@ -10067,13 +9997,13 @@ def sync_dynamic_tool(ctx: RunContext[UserContext]) -> WebSearchTool:
 
 async def test_sync_dynamic_tool():
     model = TestModel()
-    agent = Agent(model, builtin_tools=[sync_dynamic_tool], deps_type=UserContext)
+    agent = Agent(model, capabilities=[NativeTool(sync_dynamic_tool)], deps_type=UserContext)
 
     with pytest.raises(UserError, match='TestModel does not support built-in tools'):
         await agent.run('Hello', deps=UserContext(location='London'))
 
     assert model.last_model_request_parameters is not None
-    tools = model.last_model_request_parameters.builtin_tools
+    tools = model.last_model_request_parameters.native_tools
     assert len(tools) == 1
     assert isinstance(tools[0], WebSearchTool)
     assert tools[0].search_context_size == 'low'
@@ -10085,10 +10015,14 @@ async def test_dynamic_tool_in_run_call():
     agent = Agent(model, deps_type=UserContext)
 
     with pytest.raises(UserError, match='TestModel does not support built-in tools'):
-        await agent.run('Hello', deps=UserContext(location='Berlin'), builtin_tools=[prepared_web_search])
+        await agent.run(
+            'Hello',
+            deps=UserContext(location='Berlin'),
+            capabilities=[NativeTool(prepared_web_search)],
+        )
 
     assert model.last_model_request_parameters is not None
-    tools = model.last_model_request_parameters.builtin_tools
+    tools = model.last_model_request_parameters.native_tools
     assert len(tools) == 1
     tool = tools[0]
     assert isinstance(tool, WebSearchTool)

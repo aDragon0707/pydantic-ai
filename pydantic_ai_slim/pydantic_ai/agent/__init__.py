@@ -169,25 +169,43 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
     end_strategy: EndStrategy
     """The strategy for handling multiple tool calls when a final result is found.
 
-    Tools execute in the order the model emitted them. Strategies differ only in their
-    stop semantics once an output tool produces a valid final result:
+    Tools execute in parallel by default; the strategy controls when to stop waiting,
+    not what order to run. The "first valid output wins by emission order" rule holds
+    across all strategies — the model's first-emitted output tool that validates and
+    executes successfully becomes the final result.
 
-    - `'early'` (default): Stops the run as soon as an output tool produces a valid final result.
-      Function and output tools emitted *after* it are skipped; tools emitted *before* it still run.
-    - `'graceful'`: Skips remaining output tool calls once a valid final result is found,
-      but continues executing function tools.
-    - `'exhaustive'`: Runs every tool call. The first valid output tool result becomes the final output.
+    - `'early'` (default): All tasks launch in parallel; as soon as the first-emission-order
+      output tool completes successfully, any tasks still pending are cancelled. Tasks that
+      had already completed by then keep their results; this is the lowest-latency strategy
+      but may skip function-tool retries that didn't finish in time.
+    - `'graceful'`: All tasks launch in parallel; the run waits for every tool to complete.
+      The first-emission-order valid output is final; later successful outputs are recorded
+      as skipped.
+    - `'exhaustive'`: Same launch and wait semantics as `'graceful'`; the message history
+      records every output tool's status (winner gets `"Final result processed."`,
+      additional ones also get `"Final result processed."` for parity with the
+      pre-v2 documented behavior — only their value is discarded).
 
-    Under all three strategies, if any tool in a batch produces a [`RetryPromptPart`][pydantic_ai.messages.RetryPromptPart]
+    Under all three strategies, if any function tool in a batch produces a [`RetryPromptPart`][pydantic_ai.messages.RetryPromptPart]
     (e.g. via [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] or unknown-tool / argument-validation errors),
-    the final result is suppressed and the retry surfaces to the model on the next round.
+    `final_result` is suppressed and the retry surfaces to the model on the next round — the
+    "retry-wins" invariant. Output-tool retries do not trigger retry-wins ("first valid output
+    wins" is order-independent for output tools).
+
+    A tool with `sequential=True` (registered via `@tool(sequential=True)` or
+    [`ToolOutput(..., sequential=True)`][pydantic_ai.output.ToolOutput]) acts as a barrier:
+    tools emitted before it complete first, the sequential tool runs alone, and tools emitted
+    after it start only once it finishes. Use it for tools whose execution environment doesn't
+    tolerate overlap; other tools around it still parallelize.
+
     Deferred tool calls ([external](../deferred-tools.md#external-tool-execution) and
     [approval-required](../deferred-tools.md#human-in-the-loop-tool-approval)) remain batched at the end of the
-    step rather than being interleaved.
+    step rather than being interleaved with parallel execution.
 
     Under [`run_stream()`][pydantic_ai.agent.AbstractAgent.run_stream] and
     [`run_stream_sync()`][pydantic_ai.agent.AbstractAgent.run_stream_sync] the streamed final result is
-    committed as soon as it's detected; any later tool retries cannot revoke it.
+    committed as soon as it's detected; any later tool retries cannot revoke it (the retry-wins
+    invariant does not apply under streaming).
     """
 
     model_settings: AgentModelSettings[AgentDepsT] | None

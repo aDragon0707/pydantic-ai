@@ -20,9 +20,9 @@ from pydantic_ai._instrumentation import DEFAULT_INSTRUMENTATION_VERSION
 from pydantic_ai._utils import cancel_and_drain, dataclasses_no_defaults_repr, now_utc
 from pydantic_ai._uuid import uuid7
 from pydantic_ai.capabilities.abstract import AbstractCapability
+from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.native_tools import AbstractNativeTool
 from pydantic_ai.native_tools._tool_search import ToolSearchTool
-from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.tool_manager import ToolManager, ValidatedToolCall
 from pydantic_graph import BaseNode, GraphRunContext
 from pydantic_graph.beta import Graph, GraphBuilder
@@ -793,6 +793,7 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
                 response = await req_ctx.model.request(
                     req_ctx.messages, req_ctx.model_settings, req_ctx.model_request_parameters
                 )
+                response = _narrow_tool_call_parts(response, req_ctx.model_request_parameters)
                 _handler_response = response
                 return response
 
@@ -1160,12 +1161,12 @@ class CallToolsNode(AgentNode[DepsT, NodeRunEndT]):
                         tool_calls.append(part)
                     elif isinstance(part, _messages.FilePart):
                         files.append(part.content)
-                    elif isinstance(part, _messages.BuiltinToolCallPart):
+                    elif isinstance(part, _messages.NativeToolCallPart):
                         # Text parts before a built-in tool call are essentially thoughts,
                         # not part of the final result output, so we reset the accumulated text
                         text = ''
                         yield _messages.BuiltinToolCallEvent(part)  # pyright: ignore[reportDeprecated]
-                    elif isinstance(part, _messages.BuiltinToolReturnPart):
+                    elif isinstance(part, _messages.NativeToolReturnPart):
                         yield _messages.BuiltinToolResultEvent(part)  # pyright: ignore[reportDeprecated]
                     elif isinstance(part, _messages.ThinkingPart):
                         pass
@@ -1284,7 +1285,7 @@ class CallToolsNode(AgentNode[DepsT, NodeRunEndT]):
                 for part in message.parts:
                     if isinstance(part, _messages.TextPart):
                         text += part.content
-                    elif isinstance(part, _messages.BuiltinToolCallPart):
+                    elif isinstance(part, _messages.NativeToolCallPart):
                         # Text parts before a built-in tool call are essentially thoughts,
                         # not part of the final result output, so we reset the accumulated text.
                         text = ''  # pragma: no cover
@@ -1424,22 +1425,120 @@ def _build_output_run_context(
     )
 
 
-def _emit_skipped_output_tool(
+def _make_output_status_part(
     call: _messages.ToolCallPart,
-    message: str,
+    content: str,
     output_parts: list[_messages.ModelRequestPart],
-    *,
-    args_valid: bool | None = None,
-) -> Iterator[_messages.HandleResponseEvent]:
-    """Yield events for an output tool call that was skipped, and append the result to output_parts."""
-    yield _messages.FunctionToolCallEvent(call, args_valid=args_valid)
+) -> _messages.ToolReturnPart:
+    """Synthesize and append a status `ToolReturnPart` for an output tool call (success or skip).
+
+    Sites that retry use the part returned by validation/execution directly, not a synthesized one.
+    """
     part = _messages.ToolReturnPart(
         tool_name=call.tool_name,
-        content=message,
+        content=content,
         tool_call_id=call.tool_call_id,
     )
     output_parts.append(part)
+    return part
+
+
+def _emit_output_tool_events(
+    call: _messages.ToolCallPart,
+    part: _messages.ToolReturnPart | _messages.RetryPromptPart,
+    *,
+    args_valid: bool | None = None,
+) -> Iterator[_messages.HandleResponseEvent]:
+    """Yield `OutputToolCallEvent` and `OutputToolResultEvent` for an output tool call."""
+    yield _messages.OutputToolCallEvent(call, args_valid=args_valid)
+    yield _messages.OutputToolResultEvent(part)
+
+
+def _emit_legacy_output_tool_function_events(
+    call: _messages.ToolCallPart,
+    part: _messages.ToolReturnPart | _messages.RetryPromptPart,
+    *,
+    args_valid: bool | None,
+) -> Iterator[_messages.HandleResponseEvent]:
+    """Yield legacy `FunctionToolCallEvent` / `FunctionToolResultEvent` for an output tool call.
+
+    These keep firing on output-tool failure paths (skipped, validation/execution failure triggering
+    a retry) for backward compatibility, so consumers matching the legacy event types still see them.
+    They will stop firing in v2; users should match `OutputToolCallEvent` / `OutputToolResultEvent`
+    (or the shared `ToolCallEvent` / `ToolResultEvent` bases) instead. No runtime warning is fired
+    so that already-migrated consumers don't see noise on every output-tool retry.
+    """
+    yield _messages.FunctionToolCallEvent(call, args_valid=args_valid)
     yield _messages.FunctionToolResultEvent(part)
+
+
+@dataclasses.dataclass
+class _OutputCallResult(Generic[NodeRunEndT]):
+    """Result of running an output-tool task in `process_tool_calls`.
+
+    Exactly one of `final_result` (success), `retry_part` (validation/execution retry),
+    or `raise_exc` (max retries exceeded — re-raised by the caller if no other output
+    produced a valid result) is set. `args_valid` carries the validation outcome for
+    event emission and to distinguish validation vs execution failures.
+    """
+
+    call: _messages.ToolCallPart
+    args_valid: bool | None = None
+    final_result: result.FinalResult[NodeRunEndT] | None = None
+    retry_part: _messages.RetryPromptPart | None = None
+    raise_exc: BaseException | None = None
+
+
+async def _run_output_tool_call(
+    tool_manager: ToolManager[DepsT],
+    call: _messages.ToolCallPart,
+    schema: _output.OutputSchema[NodeRunEndT],
+    output_retries_used_increment: list[int],
+    max_output_retries: int,
+) -> _OutputCallResult[NodeRunEndT]:
+    """Validate and execute an output tool call.
+
+    Returns a structured result; the caller in `process_tool_calls` interprets it and
+    emits events. Output-tool retries never trigger retry-wins (the "first valid output
+    wins" invariant) — that's enforced by the caller, not here.
+
+    `output_retries_used_increment[0]` accumulates retry-budget increments so the caller
+    applies them after the parallel section completes (avoiding interleaved race writes).
+
+    `UnexpectedModelBehavior` (max retries exceeded) is captured into `raise_exc` rather
+    than raised inline so the caller can decide whether to re-raise (no other output
+    produced a valid result) or absorb as a skip (another output succeeded).
+    """
+    try:
+        validated = await tool_manager.validate_output_tool_call(call, schema=schema)
+    except exceptions.UnexpectedModelBehavior as e:
+        # Match the legacy error wording so callers / docs / tests see a consistent message
+        # for both validation and execution max-retries-exceeded errors.
+        tool = tool_manager.tools.get(call.tool_name) if tool_manager.tools else None
+        max_retries = tool.max_retries if tool is not None else max_output_retries
+        wrapped = exceptions.UnexpectedModelBehavior(f'Exceeded maximum output retries ({max_retries})')
+        wrapped.__cause__ = e.__cause__ or e
+        return _OutputCallResult(call=call, args_valid=False, raise_exc=wrapped)
+    args_valid = validated.args_valid
+    if not args_valid:
+        assert validated.validation_error is not None
+        output_retries_used_increment[0] += 1
+        return _OutputCallResult(call=call, args_valid=False, retry_part=validated.validation_error.tool_retry)
+
+    try:
+        result_data: Any = await tool_manager.execute_output_tool_call(validated, schema=schema)
+    except exceptions.UnexpectedModelBehavior as e:
+        # Pre-wrap as the canonical max-retries error for the caller's re-raise path.
+        max_retries = validated.tool.max_retries if validated.tool else max_output_retries
+        wrapped = exceptions.UnexpectedModelBehavior(f'Exceeded maximum output retries ({max_retries})')
+        wrapped.__cause__ = e.__cause__ or e
+        return _OutputCallResult(call=call, args_valid=True, raise_exc=wrapped)
+    except ToolRetryError as e:
+        output_retries_used_increment[0] += 1
+        return _OutputCallResult(call=call, args_valid=True, retry_part=e.tool_retry)
+
+    final_result = result.FinalResult(result_data, call.tool_name, call.tool_call_id)
+    return _OutputCallResult(call=call, args_valid=True, final_result=final_result)
 
 
 async def process_tool_calls(  # noqa: C901
@@ -1452,21 +1551,33 @@ async def process_tool_calls(  # noqa: C901
     output_parts: list[_messages.ModelRequestPart],
     output_final_result: deque[result.FinalResult[NodeRunEndT]] = deque(maxlen=1),
 ) -> AsyncIterator[_messages.HandleResponseEvent]:
-    """Process tool calls in the order the model emitted them.
+    """Process tool calls in parallel; strategies control completion semantics.
 
-    Output tools and function tools execute interleaved according to the model's emission
-    order. Strategies (`'early'`, `'graceful'`, `'exhaustive'`) differ only in stop semantics
-    once an output tool sets `final_result`. Deferred tools (`external`, `unapproved`) are
-    collected during the walk and resolved as a single batch at the end of the step.
+    All tool calls (output, function, unknown) launch concurrently as tasks. Strategies
+    (`'early'`, `'graceful'`, `'exhaustive'`) differ only in when we stop waiting:
 
-    If any tool in the batch produces a `RetryPromptPart`, `final_result` is suppressed so
-    the model addresses the retries on the next round (the "retry-wins" invariant). This
-    only applies when `final_result` was set inside this function — when it's passed in by
-    `Agent.run_stream`, the streamed output is already committed and cannot be revoked.
+    - `'early'`: launch all; when the first-emission-order output tool succeeds (after all
+      earlier-emission outputs complete), cancel any pending tasks and finalize.
+    - `'graceful'`: launch all; wait for everything. Subsequent successful output tools skip;
+      function tools always complete.
+    - `'exhaustive'`: launch all; wait for everything. First-emission-order valid output wins.
 
-    Also add stub return parts for any other tools that need it.
+    A tool with `sequential=True` acts as a barrier: it executes alone (no overlap), with
+    tools before it (in emission order) completing first, and tools after it starting only
+    after it finishes.
 
-    Because async iterators can't have return values, we use `output_parts` and `output_final_result` as output arguments.
+    Deferred tools (`external`, `unapproved`) without supplied results are collected during
+    the walk and resolved as a single batch at the end of the step (documented exception
+    to parallel execution).
+
+    If any function/unknown tool in the batch produces a `RetryPromptPart`, `final_result`
+    is suppressed so the model addresses the retries on the next round (the "retry-wins"
+    invariant). Output-tool retries do not trigger this (the "first valid output wins"
+    invariant). Retry-wins only applies when `final_result` was set inside this function —
+    when it's passed in by `Agent.run_stream`, the streamed output is already committed.
+
+    Because async iterators can't have return values, we use `output_parts` and
+    `output_final_result` as output arguments.
     """
     end_strategy = ctx.deps.end_strategy
 
@@ -1476,14 +1587,14 @@ async def process_tool_calls(  # noqa: C901
     # Track the call that internally set `final_result` so we can rewrite its `ToolReturnPart`
     # if retry-wins suppresses the result later.
     final_result_tool_call_id: str | None = None
-    # Set when a `RetryPromptPart` is added that should trigger retry-wins. Output-tool
-    # retries that occur AFTER `final_result` is set do not count: "first valid output wins".
+    # Set when a `RetryPromptPart` from a function/unknown tool is added. Output-tool retries
+    # never trigger retry-wins ("first valid output wins").
     retry_wins_triggered = False
 
     deferred_calls: dict[Literal['external', 'unapproved'], list[_messages.ToolCallPart]] = defaultdict(list)
     deferred_metadata: dict[str, dict[str, Any]] = {}
 
-    # Classify each call once; reuse below.
+    # Classify each call once.
     call_kinds: list[ToolKind | Literal['unknown']] = []
     for call in tool_calls:
         tool_def = tool_manager.get_tool_def(call.tool_name)
@@ -1492,7 +1603,7 @@ async def process_tool_calls(  # noqa: C901
     # When resuming with `tool_call_results`, deferred kinds are executed via the regular
     # tool pipeline (their results are supplied) rather than batched at the end of the step.
     if tool_call_results is not None:
-        executable_kinds: tuple[ToolKind | Literal['unknown'], ...] = (
+        executable_function_kinds: tuple[ToolKind | Literal['unknown'], ...] = (
             'function',
             'unknown',
             'external',
@@ -1501,7 +1612,7 @@ async def process_tool_calls(  # noqa: C901
 
         result_tool_call_ids = set(tool_call_results.keys())
         eligible_call_ids = {
-            call.tool_call_id for call, kind in zip(tool_calls, call_kinds) if kind in executable_kinds
+            call.tool_call_id for call, kind in zip(tool_calls, call_kinds) if kind in executable_function_kinds
         }
         if eligible_call_ids != result_tool_call_ids:
             raise exceptions.UserError(
@@ -1509,260 +1620,450 @@ async def process_tool_calls(  # noqa: C901
                 f'Expected: {eligible_call_ids}, got: {result_tool_call_ids}'
             )
 
-        # Filter out calls that were already executed before and should now be skipped
+        # Filter out calls that were already executed before and should now be skipped.
         calls_to_run_results: dict[str, DeferredToolResult] = {
             call_id: value for call_id, value in tool_call_results.items() if value != 'skip'
         }
     else:
-        executable_kinds = ('function', 'unknown')
+        executable_function_kinds = ('function', 'unknown')
         calls_to_run_results = {}
 
-    # Walk the tool calls in emission order. Consecutive executable (function/unknown,
-    # plus deferred-with-result on resume) calls are batched into a single `_call_tools`
-    # invocation to preserve parallelism within the group.
-    i = 0
-    while i < len(tool_calls):
-        call = tool_calls[i]
-        kind = call_kinds[i]
+    # Separate executable calls (run as parallel tasks) from deferred-without-result
+    # (collected for end-of-step batch). Preserve emission order.
+    executable_indices: list[int] = []
+    for i, kind in enumerate(call_kinds):
+        if kind == 'output' or kind in executable_function_kinds:
+            if tool_call_results is not None and tool_calls[i].tool_call_id not in calls_to_run_results:
+                # Already executed in a previous step; skip.
+                continue
+            executable_indices.append(i)
+        # Deferred kinds without supplied results are handled by the end-of-step batch.
 
-        if kind == 'output':
-            # `final_result` can be passed into `process_tool_calls` from `Agent.run_stream`
-            # when streaming and there's already a final result.
-            if final_result and final_result.tool_call_id == call.tool_call_id:
+    # When streaming committed a `final_result` externally, the committed output tool's
+    # status part is emitted in emission order alongside other stubs. Under `early`, all
+    # other tools are skipped. Under `graceful`/`exhaustive`, function tools and additional
+    # output tools still run via the parallel batch below; the committed result is the
+    # winner and other outputs' results are recorded as "skipped".
+    if final_result is not None and final_result_was_set_externally and end_strategy == 'early':
+        for i in executable_indices:
+            call = tool_calls[i]
+            kind = call_kinds[i]
+            if kind == 'output' and call.tool_call_id == final_result.tool_call_id:
+                part = _make_output_status_part(call, 'Final result processed.', output_parts)
+                for event in _emit_output_tool_events(call, part, args_valid=True):
+                    yield event
+            elif kind == 'output':
+                part = _make_output_status_part(
+                    call, 'Output tool not used - a final result was already processed.', output_parts
+                )
+                for event in _emit_output_tool_events(call, part, args_valid=None):
+                    yield event
+                for event in _emit_legacy_output_tool_function_events(call, part, args_valid=None):
+                    yield event
+            else:
                 output_parts.append(
                     _messages.ToolReturnPart(
                         tool_name=call.tool_name,
-                        content='Final result processed.',
+                        content='Tool not executed - a final result was already processed.',
                         tool_call_id=call.tool_call_id,
                     )
                 )
-            # `early`/`graceful`: skip subsequent output tools once `final_result` is set.
-            elif end_strategy in ('early', 'graceful') and final_result:
-                for event in _emit_skipped_output_tool(
-                    call,
-                    'Output tool not used - a final result was already processed.',
-                    output_parts,
-                    args_valid=None,
-                ):
-                    yield event
-            else:
-                # Validate and execute the output tool call using output hooks (not tool hooks).
-                schema = ctx.deps.output_schema
-                validated: ValidatedToolCall[DepsT] | None = None
-                try:
-                    validated = await tool_manager.validate_output_tool_call(call, schema=schema)
-                except exceptions.UnexpectedModelBehavior as e:
-                    # If we already have a valid final result, don't fail the entire run.
-                    # This allows exhaustive strategy to complete successfully when at
-                    # least one output tool is valid.
-                    if final_result:
-                        for event in _emit_skipped_output_tool(
-                            call,
-                            'Output tool not used - output failed validation.',
-                            output_parts,
-                            args_valid=False,
-                        ):
-                            yield event
-                    else:
-                        ctx.state.check_incomplete_tool_call()  # pragma: lax no cover
-                        tool = (
-                            tool_manager.tools.get(call.tool_name) if tool_manager.tools else None
-                        )  # pragma: lax no cover
-                        max_retries = tool.max_retries if tool else ctx.deps.max_output_retries  # pragma: lax no cover
-                        raise exceptions.UnexpectedModelBehavior(  # pragma: lax no cover
-                            f'Exceeded maximum output retries ({max_retries})'
-                        ) from (e.__cause__ or e)
-
-                if validated is not None and not validated.args_valid:
-                    assert validated.validation_error is not None
-                    if final_result:
-                        for event in _emit_skipped_output_tool(
-                            call,
-                            'Output tool not used - output failed validation.',
-                            output_parts,
-                            args_valid=False,
-                        ):
-                            yield event
-                    else:
-                        yield _messages.FunctionToolCallEvent(call, args_valid=False)
-                        output_parts.append(validated.validation_error.tool_retry)
-                        yield _messages.FunctionToolResultEvent(validated.validation_error.tool_retry)
-                        ctx.state.output_retries_used += 1
-                        # Retry happened before `final_result` was set: this triggers retry-wins.
-                        retry_wins_triggered = True
-                    validated = None  # Suppress further processing of this call.
-
-                if validated is not None:
-                    # Validation passed - execute through output hooks.
-                    result_data: Any = None
-                    succeeded = False
-                    try:
-                        result_data = await tool_manager.execute_output_tool_call(validated, schema=schema)
-                        succeeded = True
-                    except exceptions.UnexpectedModelBehavior as e:
-                        if final_result:
-                            for event in _emit_skipped_output_tool(
-                                call,
-                                'Output tool not used - output function execution failed.',
-                                output_parts,
-                                args_valid=True,
-                            ):
-                                yield event
-                        else:
-                            ctx.state.check_incomplete_tool_call()  # pragma: lax no cover
-                            max_retries = (
-                                validated.tool.max_retries if validated.tool else ctx.deps.max_output_retries
-                            )  # pragma: lax no cover
-                            raise exceptions.UnexpectedModelBehavior(  # pragma: lax no cover
-                                f'Exceeded maximum output retries ({max_retries})'
-                            ) from (e.__cause__ or e)
-                    except ToolRetryError as e:
-                        yield _messages.FunctionToolCallEvent(call, args_valid=True)
-                        output_parts.append(e.tool_retry)
-                        yield _messages.FunctionToolResultEvent(e.tool_retry)
-                        ctx.state.output_retries_used += 1
-                        # Output-tool retries that occur AFTER `final_result` is set don't
-                        # trigger retry-wins ("first valid output wins").
-                        if final_result is None:
-                            retry_wins_triggered = True
-
-                    if succeeded:
-                        output_parts.append(
-                            _messages.ToolReturnPart(
-                                tool_name=call.tool_name,
-                                content='Final result processed.',
-                                tool_call_id=call.tool_call_id,
-                            )
-                        )
-                        # Use the first valid output tool's result as the final result.
-                        if not final_result:
-                            final_result = result.FinalResult(result_data, call.tool_name, call.tool_call_id)
-                            final_result_tool_call_id = call.tool_call_id
-
-            i += 1
-            # `early` (run_sync path): once an output tool has set `final_result`, abort
-            # the loop and skip everything remaining (output AND function). Deferred
-            # kinds are handled by the end-of-step deferred-batch path below.
-            if final_result is not None and end_strategy == 'early' and not final_result_was_set_externally:
-                for skipped_call, skipped_kind in zip(tool_calls[i:], call_kinds[i:]):
-                    if skipped_kind == 'output':
-                        for event in _emit_skipped_output_tool(
-                            skipped_call,
-                            'Output tool not used - a final result was already processed.',
-                            output_parts,
-                            args_valid=None,
-                        ):
-                            yield event
-                    elif skipped_kind in ('external', 'unapproved'):
-                        # Handled by the deferred-batch path below.
-                        continue
-                    else:
-                        # Function/unknown: append a stub return part so the message
-                        # history stays well-formed.
-                        output_parts.append(
-                            _messages.ToolReturnPart(
-                                tool_name=skipped_call.tool_name,
-                                content='Tool not executed - a final result was already processed.',
-                                tool_call_id=skipped_call.tool_call_id,
-                            )
-                        )
+        executable_indices = []
+    # For `graceful`/`exhaustive` with externally-committed final, we leave the committed
+    # output in `executable_indices` but pre-populate its `_OutputCallResult` so the
+    # parallel section skips it and the emission-order pass emits its status part in the
+    # right position.
+    pre_populated_output_results: dict[int, _OutputCallResult[NodeRunEndT]] = {}
+    if final_result is not None and final_result_was_set_externally:
+        for i in executable_indices:
+            call = tool_calls[i]
+            if call_kinds[i] == 'output' and call.tool_call_id == final_result.tool_call_id:
+                pre_populated_output_results[i] = _OutputCallResult(
+                    call=call, args_valid=True, final_result=final_result
+                )
                 break
-        elif kind in executable_kinds:
-            # Group consecutive executable calls.
-            group_start = i
-            while i < len(tool_calls) and call_kinds[i] in executable_kinds:
-                i += 1
-            group = tool_calls[group_start:i]
 
-            # When resuming with `tool_call_results`, calls already executed in the
-            # previous step are marked 'skip' and filtered out here.
-            if tool_call_results is not None:
-                group = [c for c in group if c.tool_call_id in calls_to_run_results]
-                if (
-                    not group
-                ):  # pragma: no cover  # defensive: every call in this group was already executed in the previous step.
-                    continue
+    if executable_indices:
+        # Split executable calls into segments by `sequential=True` barrier tools.
+        # Each non-barrier tool joins the current parallel group; each barrier tool is its
+        # own group of length 1.
+        segments: list[list[int]] = []
+        current: list[int] = []
+        for i in executable_indices:
+            tool_def = tool_manager.get_tool_def(tool_calls[i].tool_name)
+            is_barrier = bool(tool_def is not None and tool_def.sequential)
+            if is_barrier:
+                if current:
+                    segments.append(current)
+                    current = []
+                segments.append([i])
+            else:
+                current.append(i)
+        if current:
+            segments.append(current)
 
-            # Under `early`, when `final_result` was set externally (run_stream path),
-            # function tools are skipped. The internal-set case is short-circuited above
-            # via the abort-loop path; this branch handles the run_stream case.
-            if final_result is not None and end_strategy == 'early':
-                for c in group:
-                    output_parts.append(
-                        _messages.ToolReturnPart(
-                            tool_name=c.tool_name,
-                            content='Tool not executed - a final result was already processed.',
-                            tool_call_id=c.tool_call_id,
-                        )
-                    )
+        # Check tool-call usage limits up-front: cumulative count of all executable
+        # function-kind calls this round (output tools don't count against the limit), so a
+        # single round that exceeds the limit is rejected before any work starts.
+        function_call_count = sum(1 for i in executable_indices if call_kinds[i] != 'output')
+        if ctx.deps.usage_limits.tool_calls_limit is not None and function_call_count > 0:
+            projected_usage = deepcopy(ctx.state.usage)
+            projected_usage.tool_calls += function_call_count
+            ctx.deps.usage_limits.check_before_tool_call(projected_usage)
+
+        # Validate every call up-front in emission order so we yield the `*ToolCallEvent`s
+        # in a stable order before any work is launched. Validation results are cached for
+        # the parallel execution phase below.
+        validated_calls: dict[str, ValidatedToolCall[DepsT]] = {}
+        # Output-tool retries shouldn't race the global retry counter; accumulate increments
+        # and apply after parallel execution completes.
+        output_retries_increment: list[int] = [0]
+
+        for i in executable_indices:
+            call = tool_calls[i]
+            kind = call_kinds[i]
+            if kind == 'output':
+                # Output tools are validated and executed inside their task (so validation
+                # failures count against the output-retry budget per existing semantics).
+                # The `*ToolCallEvent`s for output tools are emitted from completion (so the
+                # `args_valid` flag reflects actual validation outcome).
                 continue
+            deferred_result = calls_to_run_results.get(call.tool_call_id)
+            if deferred_result is not None and not isinstance(deferred_result, ToolApproved):
+                # ToolDenied / ModelRetry / RetryPromptPart short-circuit inside `_call_tool`;
+                # no validation needed.
+                yield _messages.FunctionToolCallEvent(call)
+                continue
+            try:
+                if isinstance(deferred_result, ToolApproved):
+                    validate_call = call
+                    if deferred_result.override_args is not None:
+                        validate_call = dataclasses.replace(call, args=deferred_result.override_args)
+                    metadata = tool_call_metadata.get(call.tool_call_id) if tool_call_metadata else None
+                    validated_for_call = await tool_manager.validate_tool_call(
+                        validate_call, approved=True, metadata=metadata
+                    )
+                else:
+                    validated_for_call = await tool_manager.validate_tool_call(call)
+            except exceptions.UnexpectedModelBehavior:
+                ctx.state.check_incomplete_tool_call()
+                yield _messages.FunctionToolCallEvent(call, args_valid=False)
+                raise
+            validated_calls[call.tool_call_id] = validated_for_call
+            yield _messages.FunctionToolCallEvent(call, args_valid=validated_for_call.args_valid)
 
-            # Check usage limits before running tools.
-            if ctx.deps.usage_limits.tool_calls_limit is not None:
-                projected_usage = deepcopy(ctx.state.usage)
-                projected_usage.tool_calls += len(group)
-                ctx.deps.usage_limits.check_before_tool_call(projected_usage)
+        # Run each segment as a parallel group. A barrier segment (`sequential=True`) is
+        # a one-tool group and forms a serialization point.
+        # We collect per-call results (output tool returns, retry parts, etc.) indexed by
+        # the call's position in `tool_calls`, then write them to `output_parts` in
+        # emission order at the end so the message history is stable.
+        return_parts_by_index: dict[int, _messages.ModelRequestPart] = {}
+        user_parts_by_index: dict[int, _messages.UserPromptPart] = {}
+        output_results_by_index: dict[int, _OutputCallResult[NodeRunEndT]] = dict(pre_populated_output_results)
+        skip_future_segments = False
+        # Track the index in `executable_indices` of each output call so we can determine
+        # "first-emission-order output" for `early` cancellation semantics.
+        output_indices = [i for i in executable_indices if call_kinds[i] == 'output']
 
-            # Validate upfront and cache results. For ToolApproved deferred results, validate
-            # with the approval context so the event reflects the actual validation outcome.
-            # Other deferred result types (ToolDenied, ModelRetry, etc.) skip validation since
-            # the tool won't actually execute.
-            validated_calls: dict[str, ValidatedToolCall[DepsT]] = {}
-            for c in group:
-                deferred_result = calls_to_run_results.get(c.tool_call_id)
-                if deferred_result is not None and not isinstance(deferred_result, ToolApproved):
-                    yield _messages.FunctionToolCallEvent(c)
+        for segment in segments:
+            if skip_future_segments:
+                # `early` short-circuit: future segments don't run; their calls are stubbed
+                # below in the post-loop bookkeeping.
+                break
+
+            schema = ctx.deps.output_schema
+
+            # Launch all tasks in this segment in parallel.
+            output_tasks: dict[int, asyncio.Task[_OutputCallResult[NodeRunEndT]]] = {}
+            function_tasks: dict[
+                int,
+                asyncio.Task[
+                    tuple[
+                        _messages.ToolReturnPart | _messages.RetryPromptPart,
+                        str | Sequence[_messages.UserContent] | None,
+                    ]
+                ],
+            ] = {}
+
+            for i in segment:
+                call = tool_calls[i]
+                kind = call_kinds[i]
+                if i in pre_populated_output_results:
+                    # Externally-committed output (run_stream path): result is pre-set;
+                    # don't launch a task.
                     continue
-                try:
-                    if isinstance(deferred_result, ToolApproved):
-                        validate_call = c
-                        if deferred_result.override_args is not None:
-                            validate_call = dataclasses.replace(c, args=deferred_result.override_args)
-                        metadata = tool_call_metadata.get(c.tool_call_id) if tool_call_metadata else None
-                        validated_for_call = await tool_manager.validate_tool_call(
-                            validate_call, approved=True, metadata=metadata
-                        )
-                    else:
-                        validated_for_call = await tool_manager.validate_tool_call(c)
-                except exceptions.UnexpectedModelBehavior:
-                    ctx.state.check_incomplete_tool_call()
-                    yield _messages.FunctionToolCallEvent(c, args_valid=False)
-                    raise
-                validated_calls[c.tool_call_id] = validated_for_call
-                yield _messages.FunctionToolCallEvent(c, args_valid=validated_for_call.args_valid)
+                if kind == 'output':
+                    output_tasks[i] = asyncio.create_task(
+                        _run_output_tool_call(
+                            tool_manager=tool_manager,
+                            call=call,
+                            schema=schema,
+                            output_retries_used_increment=output_retries_increment,
+                            max_output_retries=ctx.deps.max_output_retries,
+                        ),
+                        name=f'output:{call.tool_name}',
+                    )
+                else:
+                    function_tasks[i] = asyncio.create_task(
+                        _call_tool(
+                            tool_manager,
+                            validated_calls.get(call.tool_call_id, call),
+                            calls_to_run_results.get(call.tool_call_id),
+                        ),
+                        name=call.tool_name,
+                    )
 
-            output_parts_len_before = len(output_parts)
-            async for event in _call_tools(
-                tool_manager=tool_manager,
-                tool_calls=group,
-                tool_call_results=calls_to_run_results,
-                validated_calls=validated_calls,
-                output_parts=output_parts,
-                output_deferred_calls=deferred_calls,
-                output_deferred_metadata=deferred_metadata,
-            ):
-                yield event
+            all_tasks: list[asyncio.Task[Any]] = [*output_tasks.values(), *function_tasks.values()]
+            # Index-from-task lookup for completion-order processing.
+            task_to_index: dict[asyncio.Task[Any], int] = {
+                **{t: i for i, t in output_tasks.items()},
+                **{t: i for i, t in function_tasks.items()},
+            }
 
-            # Any retry from a function/unknown tool always triggers retry-wins.
-            for part in output_parts[output_parts_len_before:]:
-                if isinstance(part, _messages.RetryPromptPart):
-                    retry_wins_triggered = True
+            # Per-segment deferred bookkeeping for function tools that raise
+            # `ApprovalRequired` / `CallDeferred` mid-execution.
+            segment_deferred_calls_by_index: dict[int, Literal['external', 'unapproved']] = {}
+            segment_deferred_metadata_by_index: dict[int, dict[str, Any] | None] = {}
+
+            try:
+                pending: set[asyncio.Task[Any]] = set(all_tasks)
+                while pending:
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        i = task_to_index[task]
+                        call = tool_calls[i]
+                        kind = call_kinds[i]
+                        if kind == 'output':
+                            output_result = await task
+                            output_results_by_index[i] = output_result
+                        else:
+                            try:
+                                tool_part, tool_user_content = await task
+                            except exceptions.CallDeferred as e:
+                                segment_deferred_calls_by_index[i] = 'external'
+                                segment_deferred_metadata_by_index[i] = e.metadata
+                                continue
+                            except exceptions.ApprovalRequired as e:
+                                segment_deferred_calls_by_index[i] = 'unapproved'
+                                segment_deferred_metadata_by_index[i] = e.metadata
+                                continue
+                            return_parts_by_index[i] = tool_part
+                            if tool_user_content:
+                                user_parts_by_index[i] = _messages.UserPromptPart(content=tool_user_content)
+                            if isinstance(tool_part, _messages.RetryPromptPart):
+                                retry_wins_triggered = True
+                            yield _messages.FunctionToolResultEvent(tool_part, content=tool_user_content)
+
+                    # Early-strategy cancellation: if the first-emission-order output has
+                    # succeeded AND all earlier-emission outputs have completed (success
+                    # or failure), cancel the pending tasks in this segment and skip future
+                    # segments. "Not race-driven": later outputs that finished first don't
+                    # prematurely cancel; we wait for earlier emissions to resolve.
+                    if end_strategy == 'early' and not final_result_was_set_externally and final_result is None:
+                        # Find the first-emission-order output whose result is final.
+                        for out_i in output_indices:
+                            r = output_results_by_index.get(out_i)
+                            if r is None:
+                                # Earlier-emission output still pending; wait for it.
+                                break
+                            if r.final_result is not None:
+                                final_result = r.final_result
+                                final_result_tool_call_id = r.call.tool_call_id
+                                break
+                            # This earlier-emission output failed/retried; keep looking.
+                        if final_result is not None:
+                            still_running = [t for t in all_tasks if not t.done()]
+                            if still_running:
+                                await cancel_and_drain(*still_running)
+                            skip_future_segments = True
+                            pending = set()
+                            break
+            except asyncio.CancelledError as exc:
+                await cancel_and_drain(*all_tasks, msg=exc.args[0] if exc.args else None)
+                raise
+            except BaseException:
+                await cancel_and_drain(*all_tasks)
+                raise
+
+            # Populate the per-segment deferred bookkeeping into the shared output dicts.
+            _populate_deferred_calls(
+                tool_calls,
+                segment_deferred_calls_by_index,
+                segment_deferred_metadata_by_index,
+                deferred_calls,
+                deferred_metadata,
+            )
+
+        # Apply accumulated output-retry budget once parallel execution has settled.
+        ctx.state.output_retries_used += output_retries_increment[0]
+
+        # If any output tool exceeded its retry budget AND no other output produced a
+        # valid result, the error must surface so the agent run fails. If another output
+        # succeeded, the over-retried tool is treated as a skip (consistent with the
+        # pre-Option-C behavior).
+        any_output_succeeded = any(r.final_result is not None for r in output_results_by_index.values())
+        if not any_output_succeeded:
+            for i in executable_indices:
+                r = output_results_by_index.get(i)
+                if r is not None and r.raise_exc is not None:
+                    ctx.state.check_incomplete_tool_call()  # pragma: lax no cover
+                    raise r.raise_exc
+
+        # Pick the first-emission-order valid output as `final_result` (if not yet set by
+        # `early`-strategy cancellation above).
+        if final_result is None:
+            for i in executable_indices:
+                if call_kinds[i] != 'output':
+                    continue
+                r = output_results_by_index.get(i)
+                if r is not None and r.final_result is not None:
+                    final_result = r.final_result
+                    final_result_tool_call_id = tool_calls[i].tool_call_id
                     break
-        else:
-            # Deferred call without supplied result — collect for end-of-step batch
-            # below; the walk skips it for now.
-            assert kind in ('external', 'unapproved')
-            assert tool_call_results is None
-            i += 1
 
-    # Process deferred calls (collected during the walk) as a single batch at end of step.
-    if tool_call_results is None:
-        deferred_kind_calls = [call for call, kind in zip(tool_calls, call_kinds) if kind in ('external', 'unapproved')]
-        if final_result is not None:
-            # If the run was already determined to end on deferred tool calls,
-            # we shouldn't insert return parts as the deferred tools will still get a real result.
-            if not isinstance(final_result.output, _output.DeferredToolRequests):
-                for call in deferred_kind_calls:
+        # Build the set of call IDs that landed in deferred-during-execution bookkeeping so
+        # we can route them to the deferred-batch path (which emits their stubs).
+        deferred_mid_exec_ids = {call.tool_call_id for kind_calls in deferred_calls.values() for call in kind_calls}
+
+        # Walk emission order and append every return part to `output_parts` so the
+        # message history reflects the model's intended order regardless of completion
+        # order. Emit `FunctionToolResultEvent` / `OutputToolResultEvent` here so events
+        # stream in emission order as well.
+        for i in executable_indices:
+            call = tool_calls[i]
+            kind = call_kinds[i]
+            if kind == 'output':
+                r = output_results_by_index.get(i)
+                if r is None:
+                    # Future-segment cancellation under `early`: stub with "skipped".
+                    part = _make_output_status_part(
+                        call, 'Output tool not used - a final result was already processed.', output_parts
+                    )
+                    for event in _emit_output_tool_events(call, part, args_valid=None):
+                        yield event
+                    for event in _emit_legacy_output_tool_function_events(call, part, args_valid=None):
+                        yield event
+                    continue
+                if r.final_result is not None:
+                    is_winner = final_result is not None and final_result.tool_call_id == call.tool_call_id
+                    if is_winner:
+                        part = _make_output_status_part(call, 'Final result processed.', output_parts)
+                        for event in _emit_output_tool_events(call, part, args_valid=True):
+                            yield event
+                    elif end_strategy == 'exhaustive':
+                        # Under `exhaustive`, all successful output tools have run; the
+                        # winner records "Final result processed." (above) while later-
+                        # emission-order outputs note that they ran but their value will
+                        # not be used as the agent run's final result.
+                        part = _make_output_status_part(
+                            call,
+                            'Output tool processed, but its value will not be the final result of the agent run.',
+                            output_parts,
+                        )
+                        for event in _emit_output_tool_events(call, part, args_valid=True):
+                            yield event
+                    else:
+                        # Under `early`/`graceful`, non-winning successful output tools are
+                        # treated as skipped (the existing behavior of "remaining output
+                        # tools skip once a final result is set").
+                        part = _make_output_status_part(
+                            call, 'Output tool not used - a final result was already processed.', output_parts
+                        )
+                        for event in _emit_output_tool_events(call, part, args_valid=None):
+                            yield event
+                        for event in _emit_legacy_output_tool_function_events(call, part, args_valid=None):
+                            yield event
+                elif r.raise_exc is not None:
+                    # The error was absorbed (another output succeeded). Stub as skipped.
+                    # We can distinguish validation vs execution failure by `args_valid`.
+                    skip_message = (
+                        'Output tool not used - output function execution failed.'
+                        if r.args_valid
+                        else 'Output tool not used - output failed validation.'
+                    )
+                    part = _make_output_status_part(call, skip_message, output_parts)
+                    for event in _emit_output_tool_events(call, part, args_valid=r.args_valid):
+                        yield event
+                    for event in _emit_legacy_output_tool_function_events(call, part, args_valid=r.args_valid):
+                        yield event
+                else:
+                    assert r.retry_part is not None
+                    output_parts.append(r.retry_part)
+                    for event in _emit_output_tool_events(call, r.retry_part, args_valid=r.args_valid):
+                        yield event
+                    for event in _emit_legacy_output_tool_function_events(call, r.retry_part, args_valid=r.args_valid):
+                        yield event
+            elif i in return_parts_by_index:
+                output_parts.append(return_parts_by_index[i])
+            elif call.tool_call_id not in deferred_mid_exec_ids:
+                # Cancelled via `early`-strategy short-circuit; stub for message-history
+                # well-formedness.
+                output_parts.append(
+                    _messages.ToolReturnPart(
+                        tool_name=call.tool_name,
+                        content='Tool not executed - a final result was already processed.',
+                        tool_call_id=call.tool_call_id,
+                    )
+                )
+
+        # User-content parts trail tool returns, in emission order.
+        for i in executable_indices:
+            if i in user_parts_by_index:
+                output_parts.append(user_parts_by_index[i])
+
+    # Validate and route deferred-kind calls (classified upfront as 'external'/'unapproved')
+    # into the deferred-batch path. Mid-execution `CallDeferred` / `ApprovalRequired` cases
+    # have already been routed via `_populate_deferred_calls` above.
+    upfront_deferred_calls = [tool_calls[i] for i, kind in enumerate(call_kinds) if kind in ('external', 'unapproved')]
+    if tool_call_results is None and final_result is None and upfront_deferred_calls:
+        for call in upfront_deferred_calls:
+            try:
+                validated = await tool_manager.validate_tool_call(call)
+            except exceptions.UnexpectedModelBehavior:
+                yield _messages.FunctionToolCallEvent(call, args_valid=False)
+                raise
+
+            yield _messages.FunctionToolCallEvent(call, args_valid=validated.args_valid)
+
+            if validated.args_valid:
+                deferred_kind_def = tool_manager.get_tool_def(call.tool_name)
+                if deferred_kind_def is not None and deferred_kind_def.kind == 'external':
+                    deferred_calls['external'].append(call)
+                else:
+                    deferred_calls['unapproved'].append(call)
+            else:
+                # Call execute_tool_call to raise the validation error inside a trace span;
+                # retries are already tracked by validate_tool_call() via failed_tools.
+                try:
+                    await tool_manager.execute_tool_call(validated)
+                except ToolRetryError as e:
+                    output_parts.append(e.tool_retry)
+                    retry_wins_triggered = True
+                    yield _messages.FunctionToolResultEvent(e.tool_retry)
+
+    # Stub any deferred calls as "not executed" when `final_result` is set and not itself
+    # a `DeferredToolRequests`. Covers both upfront-deferred (never routed to
+    # `deferred_calls` above because `final_result` was already set) and mid-execution-
+    # deferred function tools whose deferral landed in `deferred_calls` during the walk.
+    if (
+        tool_call_results is None
+        and final_result is not None
+        and not isinstance(final_result.output, _output.DeferredToolRequests)
+    ):
+        stubbed_ids: set[str] = set()
+        for call in upfront_deferred_calls:
+            if call.tool_call_id not in stubbed_ids:
+                output_parts.append(
+                    _messages.ToolReturnPart(
+                        tool_name=call.tool_name,
+                        content='Tool not executed - a final result was already processed.',
+                        tool_call_id=call.tool_call_id,
+                    )
+                )
+                stubbed_ids.add(call.tool_call_id)
+        for kind_calls in deferred_calls.values():
+            for call in kind_calls:
+                if call.tool_call_id not in stubbed_ids:
                     output_parts.append(
                         _messages.ToolReturnPart(
                             tool_name=call.tool_name,
@@ -1770,33 +2071,13 @@ async def process_tool_calls(  # noqa: C901
                             tool_call_id=call.tool_call_id,
                         )
                     )
-        elif deferred_kind_calls:
-            for call in deferred_kind_calls:
-                try:
-                    validated = await tool_manager.validate_tool_call(call)
-                except exceptions.UnexpectedModelBehavior:
-                    yield _messages.FunctionToolCallEvent(call, args_valid=False)
-                    raise
+                    stubbed_ids.add(call.tool_call_id)
 
-                yield _messages.FunctionToolCallEvent(call, args_valid=validated.args_valid)
-
-                if validated.args_valid:
-                    deferred_kind = tool_manager.get_tool_def(call.tool_name)
-                    if deferred_kind is not None and deferred_kind.kind == 'external':
-                        deferred_calls['external'].append(call)
-                    else:
-                        deferred_calls['unapproved'].append(call)
-                else:
-                    # Call execute_tool_call to raise the validation error inside a trace span;
-                    # retries are already tracked by validate_tool_call() via failed_tools.
-                    try:
-                        await tool_manager.execute_tool_call(validated)
-                    except ToolRetryError as e:
-                        output_parts.append(e.tool_retry)
-                        retry_wins_triggered = True
-                        yield _messages.FunctionToolResultEvent(e.tool_retry)
-
-    if not final_result and deferred_calls:
+    if (
+        tool_call_results is None
+        and final_result is None
+        and (deferred_calls['external'] or deferred_calls['unapproved'])
+    ):
         deferred_tool_requests: _output.DeferredToolRequests | None = _output.DeferredToolRequests(
             calls=deferred_calls['external'],
             approvals=deferred_calls['unapproved'],
@@ -1894,7 +2175,7 @@ async def process_tool_calls(  # noqa: C901
             if isinstance(part, _messages.ToolReturnPart) and part.tool_call_id == final_result_tool_call_id:
                 output_parts[idx] = dataclasses.replace(
                     part,
-                    content='Output tool returned a value but it was not used as the final result because another tool in the same step requires a retry.',
+                    content='Output not used as the final result.',
                 )
                 break
         final_result = None
@@ -2079,12 +2360,19 @@ async def _call_tool(
     else:
         tool_return = _messages.ToolReturn[Any](return_value=cast(Any, tool_result))
 
+    # If the called tool's `ToolDefinition.tool_kind` declares a registered typed subclass
+    # (e.g. `'tool-search'`), promote the return part to that subclass. This keeps the
+    # typed identity intact across multi-turn history: the next turn's discovery parser /
+    # cross-provider replay sees a typed `ToolSearchReturnPart` instead of a base part.
+    tool_def = tool_manager.get_tool_def(call.tool_name)
     return_part = _messages.ToolReturnPart(
         tool_name=call.tool_name,
         tool_call_id=call.tool_call_id,
         content=tool_return.return_value,
         metadata=tool_return.metadata,
+        tool_kind=tool_def.tool_kind if tool_def else None,
     )
+    return_part = _messages.ToolReturnPart.narrow_type(return_part)
 
     return return_part, tool_return.content or None
 
@@ -2174,6 +2462,40 @@ def build_agent_graph(
         ),
     )
     return g.build(validate_graph_structure=False)
+
+
+def _narrow_tool_call_parts(
+    response: _messages.ModelResponse, model_request_parameters: models.ModelRequestParameters
+) -> _messages.ModelResponse:
+    """Promote each base `ToolCallPart` in the response to its typed subclass via `ToolDefinition.tool_kind`.
+
+    Lives here rather than in each model adapter so adapter authors emit base
+    `ToolCallPart`s freely and the framework owns the typed-identity translation. Streaming
+    parts are typed up-front by `ModelResponsePartsManager` via the same lookup; this
+    function handles the non-streaming `Model.request()` return path. Either path produces
+    the same typed end state — `isinstance(part, ToolSearchCallPart)` is true from the
+    moment the call is emitted by the model.
+    """
+    tool_kind_by_name: dict[str, _messages.ToolPartKind] = {
+        td.name: td.tool_kind for td in model_request_parameters.function_tools if td.tool_kind
+    }
+    if not tool_kind_by_name:
+        return response
+
+    changed = False
+    new_parts: list[_messages.ModelResponsePart] = []
+    for part in response.parts:
+        if (
+            isinstance(part, _messages.ToolCallPart)
+            and part.tool_kind is None
+            and (tool_kind := tool_kind_by_name.get(part.tool_name)) is not None
+        ):
+            promoted = _messages.ToolCallPart.narrow_type(part, tool_kind=tool_kind)
+            new_parts.append(promoted)
+            changed = True
+        else:
+            new_parts.append(part)
+    return replace(response, parts=new_parts) if changed else response
 
 
 def _first_run_id_index(messages: list[_messages.ModelMessage], run_id: str) -> int:

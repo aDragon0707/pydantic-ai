@@ -155,17 +155,12 @@ class ToolManager(Generic[AgentDepsT]):
     def get_parallel_execution_mode(self, calls: list[ToolCallPart]) -> ParallelExecutionMode:
         """Get the effective parallel execution mode for a list of tool calls.
 
-        This takes into account both the context variable and whether any tool
-        has `sequential=True` set. If any tool requires sequential execution,
-        returns `'sequential'` regardless of the context variable.
+        Returns the value of the `parallel_execution_mode` context variable. Per-tool
+        `sequential=True` is *not* honored here — it is handled at the
+        `process_tool_calls` level as a barrier between parallel segments rather than
+        forcing the whole batch to run serially.
         """
-        # Check if any tool requires sequential execution
-        if any(tool_def.sequential for call in calls if (tool_def := self.get_tool_def(call.tool_name))):
-            return 'sequential'
-
-        mode = _parallel_execution_mode_ctx_var.get()
-
-        return mode
+        return _parallel_execution_mode_ctx_var.get()
 
     def get_tool_def(self, name: str) -> ToolDefinition | None:
         """Get the tool definition for a given tool name, or `None` if the tool is unknown."""

@@ -359,26 +359,30 @@ _(This example is complete, it can be run "as is")_
 
 ##### Parallel Output Tool Calls
 
-**Tools execute in the order the model emitted them, regardless of strategy.** When the model calls other tools in parallel with an output tool, the agent's [`end_strategy`][pydantic_ai.agent.Agent.end_strategy] controls *when to stop*, not *what order to run*:
+**Tools execute in parallel by default.** When the model calls multiple tools in one response (including alongside an output tool), Pydantic AI launches them all concurrently. The agent's [`end_strategy`][pydantic_ai.agent.Agent.end_strategy] controls *when to stop waiting*, not *what order to run*:
 
-- `'early'` (default): Stop the run as soon as an output tool produces a valid final result. Tools emitted *after* it are skipped; tools emitted *before* it still run.
-- `'graceful'`: Skip remaining output tool calls once a valid final result is found, but continue executing function tools.
-- `'exhaustive'`: Run every tool call. The first valid output tool result becomes the final output.
-
-| Strategy | Once an output tool sets the final result… |
+| Strategy | Behavior |
 |---|---|
-| `'early'` (default) | Skip everything emitted after the output tool — function and output tools alike. |
-| `'graceful'` | Skip subsequent output tools; keep running function tools. |
-| `'exhaustive'` | Run everything. First valid output tool result wins. |
+| `'early'` (default) | Launch all in parallel; cancel pending tasks as soon as the first-emission-order output tool succeeds. Lowest latency; tools still in-flight at that moment are skipped. |
+| `'graceful'` | Launch all in parallel; wait for everything to complete. First-emission-order valid output wins; later successful outputs are recorded as skipped. |
+| `'exhaustive'` | Same launch and wait semantics as `'graceful'`. The message history records every output tool's status. |
 
-The `'graceful'` and `'exhaustive'` strategies are useful when function tools have important side effects (like logging, sending notifications, or updating metrics) that should always execute. Use `'graceful'` over `'exhaustive'` when you want to avoid executing additional output tools unnecessarily — for example, when output tools have side effects that should only fire once.
+The "first valid output wins by emission order" rule holds across all three: whichever output tool the model emitted first that validates and executes successfully becomes the final result, regardless of completion order.
 
-!!! note "Retry-wins: tool retries suppress the final result"
-    Under all three strategies, if any tool in a batch produces a [`RetryPromptPart`][pydantic_ai.messages.RetryPromptPart] (e.g. via [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] from a function tool, or argument validation errors), the final result is suppressed so the model addresses the retries on the next round. The output tool that would have been the final result still records its execution in the message history, but its return part is rewritten to indicate the suppression.
+Use `'graceful'` or `'exhaustive'` when function tools have important side effects (logging, metrics, notifications) that should always execute. Use `'graceful'` over `'exhaustive'` when you want to avoid running additional output tools unnecessarily — for example, when output tools have side effects that should only fire once.
 
-    This means a `ModelRetry` from a function tool is heard even when the model called an output tool in the same response.
+!!! note "Retry-wins: function-tool retries suppress the final result"
+    Under all three strategies, if any function (or unknown) tool in a batch produces a [`RetryPromptPart`][pydantic_ai.messages.RetryPromptPart] (via [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] or argument-validation errors), the final result is suppressed and the retry surfaces to the model on the next round — the **retry-wins** invariant. The output tool's return part is rewritten to indicate the suppression.
 
-[Deferred](deferred-tools.md) tool calls ([external](deferred-tools.md#external-tool-execution) and [approval-required](deferred-tools.md#human-in-the-loop-tool-approval)) remain batched at the end of the step as a documented exception to in-order execution; see the deferred-tools page for details.
+    Output-tool retries don't trigger retry-wins (the "first valid output wins" rule is order-independent for output tools).
+
+!!! note "Sequential tools as barriers"
+    A tool with `sequential=True` (registered via `@tool(sequential=True)` or [`ToolOutput(..., sequential=True)`][pydantic_ai.output.ToolOutput]) acts as a barrier within the step: tools emitted before it complete first, the sequential tool runs alone, and tools emitted after it start only once it finishes. Use it for tools whose execution environment doesn't tolerate overlap; other tools around it still parallelize.
+
+    !!! warning "Behavior change in v2"
+        In v1, `sequential=True` on any tool forced the entire batch to run serially. In v2 it forms a barrier only around itself — other parallel tools still run concurrently between sequential barriers.
+
+[Deferred](deferred-tools.md) tool calls ([external](deferred-tools.md#external-tool-execution) and [approval-required](deferred-tools.md#human-in-the-loop-tool-approval)) remain batched at the end of the step as a documented exception to parallel execution; see the deferred-tools page for details.
 
 !!! warning "Priority of output and deferred tools in streaming methods"
     The [`run_stream()`][pydantic_ai.agent.AbstractAgent.run_stream] and [`run_stream_sync()`][pydantic_ai.agent.AbstractAgent.run_stream_sync] methods will consider the first output that matches the [output type](output.md#structured-output) (which could be text, an [output tool](output.md#tool-output) call, or a [deferred](deferred-tools.md) tool call) to be the final output of the agent run, even when the model generates (additional) tool calls after this "final" output.

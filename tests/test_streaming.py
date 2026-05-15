@@ -32,6 +32,8 @@ from pydantic_ai import (
     ModelRequest,
     ModelRequestContext,
     ModelResponse,
+    OutputToolCallEvent,
+    OutputToolResultEvent,
     PartDeltaEvent,
     PartEndEvent,
     PartStartEvent,
@@ -121,7 +123,7 @@ async def test_streamed_text_response():
                 ),
             ]
         )
-        assert result.usage() == snapshot(
+        assert result.usage == snapshot(
             RunUsage(
                 requests=2,
                 input_tokens=103,
@@ -132,7 +134,7 @@ async def test_streamed_text_response():
         response = await result.get_output()
         assert response == snapshot('{"ret_a":"a-apple"}')
         assert result.is_complete
-        assert result.timestamp() == IsNow(tz=timezone.utc)
+        assert result.timestamp == IsNow(tz=timezone.utc)
         assert result.all_messages() == snapshot(
             [
                 ModelRequest(
@@ -171,7 +173,7 @@ async def test_streamed_text_response():
                 ),
             ]
         )
-        assert result.usage() == snapshot(
+        assert result.usage == snapshot(
             RunUsage(
                 requests=2,
                 input_tokens=103,
@@ -225,7 +227,7 @@ def test_streamed_text_sync_response():
         ]
     )
     assert result.new_messages() == result.all_messages()
-    assert result.usage() == snapshot(
+    assert result.usage == snapshot(
         RunUsage(
             requests=2,
             input_tokens=103,
@@ -236,7 +238,7 @@ def test_streamed_text_sync_response():
     response = result.get_output()
     assert response == snapshot('{"ret_a":"a-apple"}')
     assert result.is_complete
-    assert result.timestamp() == IsNow(tz=timezone.utc)
+    assert result.timestamp == IsNow(tz=timezone.utc)
     assert result.response == snapshot(
         ModelResponse(
             parts=[TextPart(content='{"ret_a":"a-apple"}')],
@@ -284,7 +286,7 @@ def test_streamed_text_sync_response():
             ),
         ]
     )
-    assert result.usage() == snapshot(
+    assert result.usage == snapshot(
         RunUsage(
             requests=2,
             input_tokens=103,
@@ -415,6 +417,7 @@ async def test_streamed_text_stream():
                     model_name='test',
                     timestamp=IsNow(tz=timezone.utc),
                     provider_name='test',
+                    state='incomplete',
                 ),
                 ModelResponse(
                     parts=[TextPart(content='The cat ')],
@@ -422,6 +425,7 @@ async def test_streamed_text_stream():
                     model_name='test',
                     timestamp=IsNow(tz=timezone.utc),
                     provider_name='test',
+                    state='incomplete',
                 ),
                 ModelResponse(
                     parts=[TextPart(content='The cat sat ')],
@@ -429,6 +433,7 @@ async def test_streamed_text_stream():
                     model_name='test',
                     timestamp=IsNow(tz=timezone.utc),
                     provider_name='test',
+                    state='incomplete',
                 ),
                 ModelResponse(
                     parts=[TextPart(content='The cat sat on ')],
@@ -436,6 +441,7 @@ async def test_streamed_text_stream():
                     model_name='test',
                     timestamp=IsNow(tz=timezone.utc),
                     provider_name='test',
+                    state='incomplete',
                 ),
                 ModelResponse(
                     parts=[TextPart(content='The cat sat on the ')],
@@ -443,6 +449,7 @@ async def test_streamed_text_stream():
                     model_name='test',
                     timestamp=IsNow(tz=timezone.utc),
                     provider_name='test',
+                    state='incomplete',
                 ),
                 ModelResponse(
                     parts=[TextPart(content='The cat sat on the mat.')],
@@ -450,6 +457,7 @@ async def test_streamed_text_stream():
                     model_name='test',
                     timestamp=IsNow(tz=timezone.utc),
                     provider_name='test',
+                    state='incomplete',
                 ),
                 ModelResponse(
                     parts=[TextPart(content='The cat sat on the mat.')],
@@ -457,6 +465,7 @@ async def test_streamed_text_stream():
                     model_name='test',
                     timestamp=IsNow(tz=timezone.utc),
                     provider_name='test',
+                    state='incomplete',
                 ),
                 ModelResponse(
                     parts=[TextPart(content='The cat sat on the mat.')],
@@ -538,6 +547,7 @@ def test_streamed_text_stream_sync():
                 model_name='test',
                 timestamp=IsNow(tz=timezone.utc),
                 provider_name='test',
+                state='incomplete',
             ),
             ModelResponse(
                 parts=[TextPart(content='The cat ')],
@@ -545,6 +555,7 @@ def test_streamed_text_stream_sync():
                 model_name='test',
                 timestamp=IsNow(tz=timezone.utc),
                 provider_name='test',
+                state='incomplete',
             ),
             ModelResponse(
                 parts=[TextPart(content='The cat sat ')],
@@ -552,6 +563,7 @@ def test_streamed_text_stream_sync():
                 model_name='test',
                 timestamp=IsNow(tz=timezone.utc),
                 provider_name='test',
+                state='incomplete',
             ),
             ModelResponse(
                 parts=[TextPart(content='The cat sat on ')],
@@ -559,6 +571,7 @@ def test_streamed_text_stream_sync():
                 model_name='test',
                 timestamp=IsNow(tz=timezone.utc),
                 provider_name='test',
+                state='incomplete',
             ),
             ModelResponse(
                 parts=[TextPart(content='The cat sat on the ')],
@@ -566,6 +579,7 @@ def test_streamed_text_stream_sync():
                 model_name='test',
                 timestamp=IsNow(tz=timezone.utc),
                 provider_name='test',
+                state='incomplete',
             ),
             ModelResponse(
                 parts=[TextPart(content='The cat sat on the mat.')],
@@ -573,6 +587,7 @@ def test_streamed_text_stream_sync():
                 model_name='test',
                 timestamp=IsNow(tz=timezone.utc),
                 provider_name='test',
+                state='incomplete',
             ),
             ModelResponse(
                 parts=[TextPart(content='The cat sat on the mat.')],
@@ -580,6 +595,7 @@ def test_streamed_text_stream_sync():
                 model_name='test',
                 timestamp=IsNow(tz=timezone.utc),
                 provider_name='test',
+                state='incomplete',
             ),
             ModelResponse(
                 parts=[TextPart(content='The cat sat on the mat.')],
@@ -1973,16 +1989,16 @@ class TestMultipleToolCalls:
         )
 
     async def test_graceful_strategy_does_not_call_additional_output_tools(self):
-        """Test that 'graceful' strategy does not execute additional output tool functions."""
+        """Under streaming + `graceful`, the committed output's result wins; under Option C
+        the additional output tool's processor still runs (in parallel), but its result is
+        recorded as skipped in message history."""
         output_tools_called: list[str] = []
 
         def process_first(output: OutputType) -> OutputType:
-            """Process first output."""
             output_tools_called.append('first')
             return output
 
-        def process_second(output: OutputType) -> OutputType:  # pragma: no cover
-            """Process second output."""
+        def process_second(output: OutputType) -> OutputType:
             output_tools_called.append('second')
             return output
 
@@ -2003,54 +2019,21 @@ class TestMultipleToolCalls:
         async with agent.run_stream('test graceful output tools') as result:
             response = await result.get_output()
 
-        # Verify the result came from the first output tool
+        # The first output won (committed by streaming); second runs in parallel but is
+        # recorded as skipped in message history.
         assert isinstance(response, OutputType)
         assert response.value == 'first'
+        assert sorted(output_tools_called) == ['first', 'second']
 
-        # Verify only the first output tool was called
-        assert output_tools_called == ['first']
-
-        # Verify we got tool returns in the correct order
-        assert result.all_messages() == snapshot(
-            [
-                ModelRequest(
-                    parts=[UserPromptPart(content='test graceful output tools', timestamp=IsNow(tz=timezone.utc))],
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-                ModelResponse(
-                    parts=[
-                        ToolCallPart(tool_name='first_output', args='{"value": "first"}', tool_call_id=IsStr()),
-                        ToolCallPart(tool_name='second_output', args='{"value": "second"}', tool_call_id=IsStr()),
-                    ],
-                    usage=RequestUsage(input_tokens=50, output_tokens=8),
-                    model_name='function::stream_function',
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-                ModelRequest(
-                    parts=[
-                        ToolReturnPart(
-                            tool_name='first_output',
-                            content='Final result processed.',
-                            tool_call_id=IsStr(),
-                            timestamp=IsNow(tz=timezone.utc),
-                        ),
-                        ToolReturnPart(
-                            tool_name='second_output',
-                            content='Output tool not used - a final result was already processed.',
-                            tool_call_id=IsStr(),
-                            timestamp=IsNow(tz=timezone.utc),
-                        ),
-                    ],
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-            ]
-        )
+        # Message history reflects that the second output was skipped (its actual processor
+        # result is not used as final).
+        messages = result.all_messages()
+        last_request = messages[-1]
+        assert isinstance(last_request, ModelRequest)
+        assert [(part.tool_name, part.content) for part in last_request.parts if isinstance(part, ToolReturnPart)] == [
+            ('first_output', 'Final result processed.'),
+            ('second_output', 'Output tool not used - a final result was already processed.'),
+        ]
 
     async def test_graceful_strategy_uses_first_final_result(self):
         """Test that 'graceful' strategy uses the first final result and ignores subsequent ones."""
@@ -2316,7 +2299,7 @@ class TestMultipleToolCalls:
                         ),
                         ToolReturnPart(
                             tool_name='final_result',
-                            content='Final result processed.',
+                            content='Output tool processed, but its value will not be the final result of the agent run.',
                             timestamp=IsNow(tz=timezone.utc),
                             tool_call_id=IsStr(),
                         ),
@@ -2402,7 +2385,7 @@ class TestMultipleToolCalls:
                         ),
                         ToolReturnPart(
                             tool_name='second_output',
-                            content='Final result processed.',
+                            content='Output tool processed, but its value will not be the final result of the agent run.',
                             tool_call_id=IsStr(),
                             timestamp=IsNow(tz=timezone.utc),
                         ),
@@ -2493,16 +2476,17 @@ class TestMultipleToolCalls:
         )
 
     async def test_exhaustive_strategy_valid_first_invalid_second_output(self):
-        """Test that exhaustive strategy uses the first valid output even when the second is invalid."""
+        """Under streaming + `exhaustive` with Option C, the streamed-committed first output
+        wins; the second output's processor still runs in parallel, and its `ModelRetry`
+        (exceeding `output_retries=0`) is absorbed silently because another output
+        succeeded — the committed result is irrevocable under streaming."""
         output_tools_called: list[str] = []
 
         def process_first(output: OutputType) -> OutputType:
-            """Process first output - will be valid."""
             output_tools_called.append('first')
             return output
 
         def process_second(output: OutputType) -> OutputType:
-            """Process second output - will be invalid."""
             output_tools_called.append('second')
             raise ModelRetry('Second output validation failed')
 
@@ -2524,54 +2508,23 @@ class TestMultipleToolCalls:
         async with agent.run_stream('test valid first invalid second') as result:
             response = await result.get_output()
 
-        # Verify the result came from the first output tool (second was invalid, but we ignore it)
+        # The first output (committed by streaming) wins; the second's processor ran but
+        # its retry was absorbed because the committed first succeeded.
         assert isinstance(response, OutputType)
-        assert response.value == snapshot('valid')
+        assert response.value == 'valid'
+        # `first` was processed by the streaming layer; `second` ran in the parallel batch.
+        assert sorted(output_tools_called) == ['first', 'second']
 
-        # Verify both output tools were called
-        assert output_tools_called == snapshot(['first', 'second'])
-
-        # Verify we got appropriate messages
-        assert result.all_messages() == snapshot(
-            [
-                ModelRequest(
-                    parts=[UserPromptPart(content='test valid first invalid second', timestamp=IsNow(tz=timezone.utc))],
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-                ModelResponse(
-                    parts=[
-                        ToolCallPart(tool_name='first_output', args='{"value": "valid"}', tool_call_id=IsStr()),
-                        ToolCallPart(tool_name='second_output', args='{"value": "invalid"}', tool_call_id=IsStr()),
-                    ],
-                    usage=RequestUsage(input_tokens=50, output_tokens=8),
-                    model_name='function::stream_function',
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-                ModelRequest(
-                    parts=[
-                        ToolReturnPart(
-                            tool_name='first_output',
-                            content='Final result processed.',
-                            tool_call_id=IsStr(),
-                            timestamp=IsNow(tz=timezone.utc),
-                        ),
-                        ToolReturnPart(
-                            tool_name='second_output',
-                            content='Output tool not used - output function execution failed.',
-                            tool_call_id=IsStr(),
-                            timestamp=IsNow(tz=timezone.utc),
-                        ),
-                    ],
-                    timestamp=IsNow(tz=timezone.utc),
-                    run_id=IsStr(),
-                    conversation_id=IsStr(),
-                ),
-            ]
-        )
+        # Message history: first_output's "Final result processed." and second_output's
+        # skipped-execution stub.
+        messages = result.all_messages()
+        last_request = messages[-1]
+        assert isinstance(last_request, ModelRequest)
+        return_parts = [
+            (part.tool_name, part.content) for part in last_request.parts if isinstance(part, ToolReturnPart)
+        ]
+        assert ('first_output', 'Final result processed.') in return_parts
+        assert any(name == 'second_output' and 'Output tool not used' in str(content) for name, content in return_parts)
 
     async def test_exhaustive_strategy_with_tool_retry_and_final_result(self):
         """Under `run_stream`, retry-wins does NOT fire because `final_result` is committed
@@ -2844,7 +2797,7 @@ async def test_iter_stream_output():
                 async with node.stream(run.ctx) as stream:
                     async for chunk in stream.stream_output(debounce_by=None):
                         messages.append(chunk)
-                stream_usage = deepcopy(stream.usage())
+                stream_usage = deepcopy(stream.usage)
     assert stream is not None
     assert stream.response == snapshot(
         ModelResponse(
@@ -2856,7 +2809,7 @@ async def test_iter_stream_output():
         )
     )
     assert run.next_node == End(data=FinalResult(output='The bat sat on the mat.', tool_name=None, tool_call_id=None))
-    assert run.usage() == stream_usage == RunUsage(requests=1, input_tokens=51, output_tokens=7)
+    assert run.usage == stream_usage == RunUsage(requests=1, input_tokens=51, output_tokens=7)
 
     assert messages == snapshot(
         [
@@ -3002,6 +2955,7 @@ async def test_iter_stream_responses():
             model_name='test',
             timestamp=IsNow(tz=timezone.utc),
             provider_name='test',
+            state='incomplete',
         )
         for text in [
             '',
@@ -3092,7 +3046,7 @@ async def test_unknown_tool_call_events():
                 args_valid=True,
             ),
             FunctionToolResultEvent(
-                result=RetryPromptPart(
+                part=RetryPromptPart(
                     content="Unknown tool name: 'unknown_tool'. Available tools: 'known_tool'",
                     tool_name='unknown_tool',
                     tool_call_id=IsStr(),
@@ -3100,7 +3054,7 @@ async def test_unknown_tool_call_events():
                 ),
             ),
             FunctionToolResultEvent(
-                result=ToolReturnPart(
+                part=ToolReturnPart(
                     tool_name='known_tool',
                     content=10,
                     tool_call_id=IsStr(),
@@ -3120,23 +3074,22 @@ async def test_unknown_tool_call_events():
 
 
 async def test_output_tool_validation_failure_events():
-    """Test that output tools that fail validation emit events during streaming."""
-    call_count = 0
+    """Test that output tools that fail validation emit events during streaming.
+
+    Under Option C, output-tool retries do not trigger retry-wins, so the second valid
+    output succeeds in the same step ("first valid output wins"). The bad call emits a
+    validation-failure pair (new + legacy events) and the good call emits a success pair
+    (new events only).
+    """
 
     def call_final_result_with_bad_data(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        """Mock function that calls final_result tool with invalid data first, then valid data on retry."""
-        nonlocal call_count
-        call_count += 1
         assert info.output_tools is not None
-        if call_count == 1:
-            return ModelResponse(
-                parts=[
-                    ToolCallPart('final_result', {'bad_value': 'invalid'}),  # Invalid field name
-                    ToolCallPart('final_result', {'value': 'valid'}),  # Valid field name
-                ]
-            )
-        # Retry round: model corrects its earlier mistake.
-        return ModelResponse(parts=[ToolCallPart('final_result', {'value': 'corrected'})])
+        return ModelResponse(
+            parts=[
+                ToolCallPart('final_result', {'bad_value': 'invalid'}),  # Invalid field name
+                ToolCallPart('final_result', {'value': 'valid'}),  # Valid field name
+            ]
+        )
 
     agent = Agent(FunctionModel(call_final_result_with_bad_data), output_type=OutputType)
 
@@ -3148,12 +3101,9 @@ async def test_output_tool_validation_failure_events():
                     async for event in event_stream:
                         events.append(event)
 
-    # First round: the bad-data call emits a validation failure event. The good-data
-    # call's success is suppressed by the retry-wins invariant — no completion event.
-    # Second round: the corrected call succeeds (no events for successful output tools).
     assert events == snapshot(
         [
-            FunctionToolCallEvent(
+            OutputToolCallEvent(
                 part=ToolCallPart(
                     tool_name='final_result',
                     args={'bad_value': 'invalid'},
@@ -3161,8 +3111,8 @@ async def test_output_tool_validation_failure_events():
                 ),
                 args_valid=False,
             ),
-            FunctionToolResultEvent(
-                result=RetryPromptPart(
+            OutputToolResultEvent(
+                part=RetryPromptPart(
                     content=[
                         ErrorDetails(
                             type='missing',
@@ -3176,8 +3126,45 @@ async def test_output_tool_validation_failure_events():
                     timestamp=IsNow(tz=timezone.utc),
                 )
             ),
-            # Note: No FunctionToolCallEvent for successful output tool calls.
-            # Output tools only emit FunctionToolCallEvent on validation/execution failure.
+            FunctionToolCallEvent(
+                part=ToolCallPart(
+                    tool_name='final_result',
+                    args={'bad_value': 'invalid'},
+                    tool_call_id=IsStr(),
+                ),
+                args_valid=False,
+            ),
+            FunctionToolResultEvent(
+                part=RetryPromptPart(
+                    content=[
+                        ErrorDetails(
+                            type='missing',
+                            loc=('value',),
+                            msg='Field required',
+                            input={'bad_value': 'invalid'},
+                        ),
+                    ],
+                    tool_name='final_result',
+                    tool_call_id=IsStr(),
+                    timestamp=IsNow(tz=timezone.utc),
+                )
+            ),
+            OutputToolCallEvent(
+                part=ToolCallPart(
+                    tool_name='final_result',
+                    args={'value': 'valid'},
+                    tool_call_id=IsStr(),
+                ),
+                args_valid=True,
+            ),
+            OutputToolResultEvent(
+                part=ToolReturnPart(
+                    tool_name='final_result',
+                    content='Final result processed.',
+                    tool_call_id=IsStr(),
+                    timestamp=IsNow(tz=timezone.utc),
+                )
+            ),
         ]
     )
 
@@ -3307,7 +3294,7 @@ def test_function_tool_event_tool_call_id_properties():
 
     # Prepare a ToolReturnPart with a fixed ID
     return_part = ToolReturnPart(tool_name='sample_tool', content='ok', tool_call_id='return_id_456')
-    result_event = FunctionToolResultEvent(result=return_part)
+    result_event = FunctionToolResultEvent(part=return_part)
 
     # The event should expose the same `tool_call_id` as the result part
     assert result_event.tool_call_id == return_part.tool_call_id == 'return_id_456'
@@ -3347,8 +3334,8 @@ async def test_tool_raises_call_deferred():
         assert await result.validate_response_output(responses[0]) == snapshot(
             DeferredToolRequests(calls=[ToolCallPart(tool_name='my_tool', args={'x': 0}, tool_call_id=IsStr())])
         )
-        assert result.usage() == snapshot(RunUsage(requests=1, input_tokens=51, output_tokens=0))
-        assert result.timestamp() == IsNow(tz=timezone.utc)
+        assert result.usage == snapshot(RunUsage(requests=1, input_tokens=51, output_tokens=0))
+        assert result.timestamp == IsNow(tz=timezone.utc)
         assert result.is_complete
 
 
@@ -3609,7 +3596,7 @@ async def test_run_event_stream_handler():
                 part=ToolCallPart(tool_name='ret_a', args={'x': 'a'}, tool_call_id=IsStr()), args_valid=True
             ),
             FunctionToolResultEvent(
-                result=ToolReturnPart(
+                part=ToolReturnPart(
                     tool_name='ret_a',
                     content='a-apple',
                     tool_call_id=IsStr(),
@@ -3687,7 +3674,7 @@ def test_run_sync_event_stream_handler():
                 part=ToolCallPart(tool_name='ret_a', args={'x': 'a'}, tool_call_id=IsStr()), args_valid=True
             ),
             FunctionToolResultEvent(
-                result=ToolReturnPart(
+                part=ToolReturnPart(
                     tool_name='ret_a',
                     content='a-apple',
                     tool_call_id=IsStr(),
@@ -3738,7 +3725,7 @@ async def test_run_stream_event_stream_handler():
                 part=ToolCallPart(tool_name='ret_a', args={'x': 'a'}, tool_call_id=IsStr()), args_valid=True
             ),
             FunctionToolResultEvent(
-                result=ToolReturnPart(
+                part=ToolReturnPart(
                     tool_name='ret_a',
                     content='a-apple',
                     tool_call_id=IsStr(),
@@ -3783,7 +3770,7 @@ async def test_stream_tool_returning_user_content():
                 part=ToolCallPart(tool_name='get_image', args={}, tool_call_id=IsStr()), args_valid=True
             ),
             FunctionToolResultEvent(
-                result=ToolReturnPart(
+                part=ToolReturnPart(
                     tool_name='get_image',
                     content=ImageUrl(
                         url='https://t3.ftcdn.net/jpg/00/85/79/92/360_F_85799278_0BBGV9OAdQDTLnKwAPBCcg1J7QtiieJY.jpg'
@@ -3843,7 +3830,7 @@ async def test_run_stream_events():
                 part=ToolCallPart(tool_name='ret_a', args={'x': 'a'}, tool_call_id=IsStr()), args_valid=True
             ),
             FunctionToolResultEvent(
-                result=ToolReturnPart(
+                part=ToolReturnPart(
                     tool_name='ret_a',
                     content='a-apple',
                     tool_call_id=IsStr(),
@@ -4012,7 +3999,7 @@ async def test_args_validator_failure_events():
                 args_valid=False,
             ),
             FunctionToolResultEvent(
-                result=RetryPromptPart(
+                part=RetryPromptPart(
                     content='Validation failed: x must be positive',
                     tool_name='add_numbers',
                     tool_call_id=IsStr(),
@@ -4032,7 +4019,7 @@ async def test_args_validator_failure_events():
                 args_valid=True,
             ),
             FunctionToolResultEvent(
-                result=ToolReturnPart(
+                part=ToolReturnPart(
                     tool_name='add_numbers',
                     content=0,
                     tool_call_id=IsStr(),
@@ -4090,7 +4077,7 @@ async def test_args_validator_event_args_valid_field():
                 args_valid=True,
             ),
             FunctionToolResultEvent(
-                result=ToolReturnPart(
+                part=ToolReturnPart(
                     tool_name='add_numbers',
                     content=0,
                     tool_call_id='pyd_ai_tool_call_id__add_numbers',
@@ -4223,7 +4210,7 @@ async def test_event_ordering_call_before_result():
                 f'FunctionToolResultEvent for {event.tool_call_id} appeared before FunctionToolCallEvent'
             )
         elif isinstance(event, FunctionToolResultEvent):
-            result_id = event.result.tool_call_id
+            result_id = event.part.tool_call_id
             result_ids_seen.add(result_id)
             assert result_id in call_ids_seen, (
                 f'FunctionToolResultEvent for {result_id} appeared without prior FunctionToolCallEvent'
@@ -4311,9 +4298,9 @@ async def test_args_valid_none_for_tool_denied():
     assert tool_call_events[0].args_valid is None
 
     # FunctionToolResultEvent should contain the denial message
-    result_events = [e for e in events if isinstance(e, FunctionToolResultEvent) and e.result.tool_name == 'my_tool']
+    result_events = [e for e in events if isinstance(e, FunctionToolResultEvent) and e.part.tool_name == 'my_tool']
     assert result_events
-    assert result_events[0].result.content == 'User denied this tool call'
+    assert result_events[0].part.content == 'User denied this tool call'
 
 
 async def test_deferred_tool_validation_event_in_stream():
