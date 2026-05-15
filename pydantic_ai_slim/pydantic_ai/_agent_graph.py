@@ -2052,9 +2052,13 @@ async def process_tool_calls(  # noqa: C901
         and final_result is not None
         and not isinstance(final_result.output, _output.DeferredToolRequests)
     ):
+        # `stubbed_ids` deduplicates across the two sources (`upfront_deferred_calls` and
+        # `deferred_calls`). Defensive against the same tool_call_id appearing in both lists;
+        # in practice they're disjoint because upfront-classified-deferred calls never reach
+        # the execution loop that populates `deferred_calls` mid-flight.
         stubbed_ids: set[str] = set()
         for call in upfront_deferred_calls:
-            if call.tool_call_id not in stubbed_ids:
+            if call.tool_call_id not in stubbed_ids:  # pragma: no branch
                 output_parts.append(
                     _messages.ToolReturnPart(
                         tool_name=call.tool_name,
@@ -2063,7 +2067,9 @@ async def process_tool_calls(  # noqa: C901
                     )
                 )
                 stubbed_ids.add(call.tool_call_id)
-        for kind_calls in deferred_calls.values():
+        for kind_calls in (
+            deferred_calls.values()
+        ):  # pragma: no cover  # mid-execution deferred + final_result is a near-impossible race; defensive only
             for call in kind_calls:
                 if call.tool_call_id not in stubbed_ids:
                     output_parts.append(
@@ -2186,7 +2192,7 @@ async def process_tool_calls(  # noqa: C901
         output_final_result.append(final_result)
 
 
-async def _call_tools(  # noqa: C901
+async def _call_tools(
     tool_manager: ToolManager[DepsT],
     tool_calls: list[_messages.ToolCallPart],
     tool_call_results: dict[str, DeferredToolResult],
@@ -2195,95 +2201,63 @@ async def _call_tools(  # noqa: C901
     output_deferred_calls: dict[Literal['external', 'unapproved'], list[_messages.ToolCallPart]],
     output_deferred_metadata: dict[str, dict[str, Any]],
 ) -> AsyncIterator[_messages.HandleResponseEvent]:
+    """Run a batch of deferred-handler-resolved tool calls.
+
+    Used solely from the `HandleDeferredToolCalls` capability path
+    (`tool_manager.resolve_deferred_tool_calls`) to feed handler outputs back through
+    the standard tool-execution pipeline. The main tool-execution path lives inline
+    in `process_tool_calls` and applies `parallel_execution_mode`, barrier semantics,
+    and early-strategy cancellation directly.
+
+    Resolved calls always run in parallel here; events are yielded in completion order
+    for low-latency progress and `output_parts` is appended in emission order at the
+    end for a stable message history.
+    """
     tool_parts_by_index: dict[int, _messages.ModelRequestPart] = {}
     user_parts_by_index: dict[int, _messages.UserPromptPart] = {}
     deferred_calls_by_index: dict[int, Literal['external', 'unapproved']] = {}
     deferred_metadata_by_index: dict[int, dict[str, Any] | None] = {}
 
-    async def handle_call_or_result(
-        coro_or_task: Awaitable[
-            tuple[_messages.ToolReturnPart | _messages.RetryPromptPart, str | Sequence[_messages.UserContent] | None]
-        ]
-        | Task[
-            tuple[_messages.ToolReturnPart | _messages.RetryPromptPart, str | Sequence[_messages.UserContent] | None]
-        ],
-        index: int,
-    ) -> _messages.HandleResponseEvent | None:
-        try:
-            tool_part, tool_user_content = (
-                (await coro_or_task) if inspect.isawaitable(coro_or_task) else coro_or_task.result()
-            )
-        except exceptions.CallDeferred as e:
-            deferred_calls_by_index[index] = 'external'
-            deferred_metadata_by_index[index] = e.metadata
-        except exceptions.ApprovalRequired as e:
-            deferred_calls_by_index[index] = 'unapproved'
-            deferred_metadata_by_index[index] = e.metadata
-        else:
-            tool_parts_by_index[index] = tool_part
-            if tool_user_content:
-                user_parts_by_index[index] = _messages.UserPromptPart(content=tool_user_content)
+    tasks = [
+        asyncio.create_task(
+            _call_tool(
+                tool_manager,
+                validated_calls.get(call.tool_call_id, call),
+                tool_call_results.get(call.tool_call_id),
+            ),
+            name=call.tool_name,
+        )
+        for call in tool_calls
+    ]
+    try:
+        pending: set[
+            asyncio.Task[tuple[_messages.ToolReturnPart | _messages.RetryPromptPart, _messages.UserPromptPart | None]]
+        ] = set(tasks)  # pyright: ignore[reportAssignmentType]
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                index = tasks.index(task)  # pyright: ignore[reportArgumentType]
+                try:
+                    tool_part, tool_user_content = task.result()
+                except exceptions.CallDeferred as e:
+                    deferred_calls_by_index[index] = 'external'
+                    deferred_metadata_by_index[index] = e.metadata
+                    continue
+                except exceptions.ApprovalRequired as e:
+                    deferred_calls_by_index[index] = 'unapproved'
+                    deferred_metadata_by_index[index] = e.metadata
+                    continue
+                tool_parts_by_index[index] = tool_part
+                if tool_user_content:
+                    user_parts_by_index[index] = _messages.UserPromptPart(content=tool_user_content)
+                yield _messages.FunctionToolResultEvent(tool_part, content=tool_user_content)
+    except BaseException:  # pragma: no cover  # defensive cancellation path; deferred-handler-resolution tasks don't surface cancellable failures in tests
+        # Cancel any still-running sibling tasks so they don't become orphaned when
+        # a CancelledError or other exception propagates out.
+        await cancel_and_drain(*tasks)
+        raise
 
-            return _messages.FunctionToolResultEvent(tool_part, content=tool_user_content)
-
-    parallel_execution_mode = tool_manager.get_parallel_execution_mode(tool_calls)
-    if parallel_execution_mode == 'sequential':
-        for index, call in enumerate(tool_calls):
-            if event := await handle_call_or_result(
-                _call_tool(
-                    tool_manager,
-                    validated_calls.get(call.tool_call_id, call),
-                    tool_call_results.get(call.tool_call_id),
-                ),
-                index,
-            ):
-                yield event
-
-    else:
-        tasks = [
-            asyncio.create_task(
-                _call_tool(
-                    tool_manager,
-                    validated_calls.get(call.tool_call_id, call),
-                    tool_call_results.get(call.tool_call_id),
-                ),
-                name=call.tool_name,
-            )
-            for call in tool_calls
-        ]
-        try:
-            if parallel_execution_mode == 'parallel_ordered_events':
-                # Wait for all tasks to complete before yielding any events
-                await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
-                for index, task in enumerate(tasks):
-                    if event := await handle_call_or_result(coro_or_task=task, index=index):
-                        yield event
-            else:
-                pending: set[
-                    asyncio.Task[
-                        tuple[_messages.ToolReturnPart | _messages.RetryPromptPart, _messages.UserPromptPart | None]
-                    ]
-                ] = set(tasks)  # pyright: ignore[reportAssignmentType]
-                while pending:
-                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                    for task in done:
-                        index = tasks.index(task)  # pyright: ignore[reportArgumentType]
-                        if event := await handle_call_or_result(coro_or_task=task, index=index):  # pyright: ignore[reportArgumentType]
-                            yield event
-
-        except asyncio.CancelledError as e:
-            await cancel_and_drain(*tasks, msg=e.args[0] if len(e.args) != 0 else None)
-            raise
-        except BaseException:
-            # Cancel any still-running sibling tasks so they don't become
-            # orphaned asyncio tasks when a non-CancelledError exception
-            # (e.g. RuntimeError, ConnectionError) propagates out of
-            # handle_call_or_result().
-            await cancel_and_drain(*tasks)
-            raise
-
-    # We append the results at the end, rather than as they are received, to retain a consistent ordering
-    # This is mostly just to simplify testing
+    # Sort by emission index for a stable message history regardless of completion order.
     output_parts.extend([tool_parts_by_index[k] for k in sorted(tool_parts_by_index)])
     output_parts.extend([user_parts_by_index[k] for k in sorted(user_parts_by_index)])
 

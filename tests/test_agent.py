@@ -4398,6 +4398,48 @@ class TestMultipleToolCalls:
         final_result_part = next(p for p in return_parts if p.tool_name == 'final_result')
         assert final_result_part.content == 'Final result processed.'
 
+    def test_early_strategy_with_barrier_after_final_result(self):
+        """Early-strategy cancellation skips later segments when a `sequential=True` barrier
+        is emitted *after* the winning output tool."""
+        execution_log: list[str] = []
+
+        def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            assert info.output_tools is not None
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('regular_tool', {'x': 1}),
+                    ToolCallPart('final_result', {'value': 'final'}),
+                    ToolCallPart('barrier_tool'),
+                    ToolCallPart('after_tool', {'y': 2}),
+                ],
+            )
+
+        agent = Agent(FunctionModel(return_model), output_type=OutputType, end_strategy='early')
+
+        @agent.tool_plain
+        def regular_tool(x: int) -> int:  # pragma: lax no cover  # may be cancelled before being invoked
+            execution_log.append('regular')
+            return x
+
+        @agent.tool_plain(sequential=True)
+        def barrier_tool() -> str:  # pragma: no cover  # never reached because final_result wins first segment
+            execution_log.append('barrier')
+            return 'barrier'
+
+        @agent.tool_plain
+        def after_tool(y: int) -> int:  # pragma: no cover  # in the post-barrier segment, also skipped
+            execution_log.append('after')
+            return y
+
+        result = agent.run_sync('test early with barrier after final result')
+
+        assert isinstance(result.output, OutputType)
+        assert result.output.value == 'final'
+        # barrier_tool and after_tool are in segments after final_result; once final_result
+        # wins, the segment loop short-circuits and they're stubbed as "not executed".
+        assert 'barrier' not in execution_log
+        assert 'after' not in execution_log
+
     def test_early_strategy_with_external_tool_call(self):
         """Test that early strategy handles external tool calls correctly.
 
