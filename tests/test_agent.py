@@ -61,7 +61,7 @@ from pydantic_ai._output import (
     TextOutput,
 )
 from pydantic_ai.agent import AgentRunResult, WrapperAgent
-from pydantic_ai.builtin_tools import (
+from pydantic_ai.native_tools import (
     CodeExecutionTool,
     MCPServerTool,
     WebSearchTool,
