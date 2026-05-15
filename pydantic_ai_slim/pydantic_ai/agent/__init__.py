@@ -182,9 +182,11 @@ class Agent(AbstractAgent[AgentDepsT, OutputDataT]):
       The first-emission-order valid output is final; later successful outputs are recorded
       as skipped.
     - `'exhaustive'`: Same launch and wait semantics as `'graceful'`; the message history
-      records every output tool's status (winner gets `"Final result processed."`,
-      additional ones also get `"Final result processed."` for parity with the
-      pre-v2 documented behavior — only their value is discarded).
+      transparently records every output tool's outcome. The winner gets
+      `"Final result processed."`; additional successful outputs get a distinct
+      `"Output tool processed, but its value will not be the final result of the agent run."`
+      so the model can see that the tool ran but lost the priority race. Use this strategy
+      when you want full visibility into every output tool that fired.
 
     Under all three strategies, if any function tool in a batch produces a [`RetryPromptPart`][pydantic_ai.messages.RetryPromptPart]
     (e.g. via [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] or unknown-tool / argument-validation errors),

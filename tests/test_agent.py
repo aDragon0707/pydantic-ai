@@ -4391,14 +4391,12 @@ class TestMultipleToolCalls:
         last_request = result.all_messages()[-1]
         assert isinstance(last_request, ModelRequest)
         return_parts = [part for part in last_request.parts if isinstance(part, ToolReturnPart)]
-        # The final_result tool's return part records success; pending tools (regular_tool,
-        # another_tool, deferred_tool) are stubbed as "not executed". The function tools may
-        # also have completed in time (race with the output tool); either way the message
-        # history contains exactly one part per call.
-        assert {p.tool_name for p in return_parts} == {'regular_tool', 'final_result', 'another_tool', 'deferred_tool'}
-        final_result_parts = [p for p in return_parts if p.tool_name == 'final_result']
-        assert len(final_result_parts) == 1
-        assert final_result_parts[0].content == 'Final result processed.'
+        # Return parts are appended in emission order, one per call. The function tools may
+        # have completed in time (race with the output tool) or been cancelled and stubbed
+        # as "not executed", so their `content` is nondeterministic and not asserted here.
+        assert [p.tool_name for p in return_parts] == ['regular_tool', 'final_result', 'another_tool', 'deferred_tool']
+        final_result_part = next(p for p in return_parts if p.tool_name == 'final_result')
+        assert final_result_part.content == 'Final result processed.'
 
     def test_early_strategy_with_external_tool_call(self):
         """Test that early strategy handles external tool calls correctly.

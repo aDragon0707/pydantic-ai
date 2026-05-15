@@ -2743,6 +2743,94 @@ class TestMultipleToolCalls:
             ('log_attempt', 'after'),
         ]
 
+    async def test_function_tool_with_sequential_barrier(self):
+        """A function tool with `sequential=True` runs alone; tools before run first, tools after run after."""
+        execution_log: list[str] = []
+        in_flight: list[str] = []
+        max_concurrent_around_barrier = 0
+
+        async def parallel_tool(name: str) -> str:
+            in_flight.append(name)
+            nonlocal max_concurrent_around_barrier
+            max_concurrent_around_barrier = max(max_concurrent_around_barrier, len(in_flight))
+            await asyncio.sleep(0.01)
+            execution_log.append(name)
+            in_flight.remove(name)
+            return name
+
+        async def barrier_tool() -> str:
+            assert in_flight == [], f'Sequential tool overlapped with {in_flight}'
+            execution_log.append('barrier')
+            return 'barrier'
+
+        async def sf(_: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str | DeltaToolCalls]:
+            assert info.output_tools is not None
+            yield {1: DeltaToolCall('parallel_tool', '{"name": "before_a"}')}
+            yield {2: DeltaToolCall('parallel_tool', '{"name": "before_b"}')}
+            yield {3: DeltaToolCall('barrier_tool', '{}')}
+            yield {4: DeltaToolCall('parallel_tool', '{"name": "after_a"}')}
+            yield {5: DeltaToolCall('parallel_tool', '{"name": "after_b"}')}
+            yield {6: DeltaToolCall('final_result', '{"value": "done"}')}
+
+        agent = Agent(FunctionModel(stream_function=sf), output_type=OutputType, end_strategy='exhaustive')
+        agent.tool_plain(parallel_tool)
+        agent.tool_plain(sequential=True)(barrier_tool)
+
+        async with agent.run_stream('test sequential barrier') as result:
+            response = await result.get_output()
+
+        before_idx = execution_log.index('barrier')
+        before = set(execution_log[:before_idx])
+        after = set(execution_log[before_idx + 1 :])
+        assert before == {'before_a', 'before_b'}
+        assert {'after_a', 'after_b'} <= after
+        assert max_concurrent_around_barrier >= 2
+        assert isinstance(response, OutputType)
+        assert response.value == 'done'
+
+    async def test_output_tool_with_sequential_barrier(self):
+        """An output tool with `sequential=True` runs alone — its processor doesn't overlap
+        with function tools. Under streaming, the output tool is committed during the stream
+        phase (before the post-stream `process_tool_calls` runs the function tools), so the
+        barrier degenerates to "output runs in its own phase" rather than sandwiching the
+        function tools the way the non-streaming variant does."""
+        execution_log: list[str] = []
+        in_flight: list[str] = []
+
+        async def parallel_tool(name: str) -> str:
+            in_flight.append(name)
+            await asyncio.sleep(0.01)
+            execution_log.append(name)
+            in_flight.remove(name)
+            return name
+
+        def process_output(output: OutputType) -> OutputType:
+            assert in_flight == [], f'Sequential output overlapped with {in_flight}'
+            execution_log.append('final')
+            return output
+
+        async def sf(_: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str | DeltaToolCalls]:
+            assert info.output_tools is not None
+            yield {1: DeltaToolCall('parallel_tool', '{"name": "before_a"}')}
+            yield {2: DeltaToolCall('parallel_tool', '{"name": "before_b"}')}
+            yield {3: DeltaToolCall('final_result', '{"value": "done"}')}
+            yield {4: DeltaToolCall('parallel_tool', '{"name": "after_a"}')}
+
+        agent = Agent(
+            FunctionModel(stream_function=sf),
+            output_type=ToolOutput(process_output, name='final_result', sequential=True),
+            end_strategy='exhaustive',
+        )
+        agent.tool_plain(parallel_tool)
+
+        async with agent.run_stream('test sequential output barrier') as result:
+            response = await result.get_output()
+
+        assert 'final' in execution_log
+        assert {'before_a', 'before_b', 'after_a'} <= set(execution_log)
+        assert isinstance(response, OutputType)
+        assert response.value == 'done'
+
     # NOTE: When changing tests in this class:
     # 1. Follow the existing order
     # 2. Update tests in `tests/test_agent.py::TestMultipleToolCallsStreaming` as well

@@ -364,12 +364,12 @@ _(This example is complete, it can be run "as is")_
 | Strategy | Behavior |
 |---|---|
 | `'early'` (default) | Launch all in parallel; cancel pending tasks as soon as the first-emission-order output tool succeeds. Lowest latency; tools still in-flight at that moment are skipped. |
-| `'graceful'` | Launch all in parallel; wait for everything to complete. First-emission-order valid output wins; later successful outputs are recorded as skipped. |
-| `'exhaustive'` | Same launch and wait semantics as `'graceful'`. The message history records every output tool's status. |
+| `'graceful'` | Launch all in parallel; wait for everything to complete. First-emission-order valid output wins; the return parts of later successful outputs are rewritten to `"Output tool not used - a final result was already processed."` so the model treats them as no-ops. |
+| `'exhaustive'` | Same launch and wait semantics as `'graceful'`, but later successful outputs keep a distinct status — `"Output tool processed, but its value will not be the final result of the agent run."` — so the model sees that the tool *did* execute and lost only the priority race. |
 
 The "first valid output wins by emission order" rule holds across all three: whichever output tool the model emitted first that validates and executes successfully becomes the final result, regardless of completion order.
 
-Use `'graceful'` or `'exhaustive'` when function tools have important side effects (logging, metrics, notifications) that should always execute. Use `'graceful'` over `'exhaustive'` when you want to avoid running additional output tools unnecessarily — for example, when output tools have side effects that should only fire once.
+The practical difference between `'graceful'` and `'exhaustive'` is what the model sees in the message history. Under `'graceful'`, non-winning output tools look like they were skipped. Under `'exhaustive'`, they're transparently recorded as having run — useful when output tools have observable side effects and you want the model to know they fired. Pick `'graceful'` when you'd rather minimize follow-up reasoning about non-winning calls; pick `'exhaustive'` when full visibility is more important.
 
 !!! note "Retry-wins: function-tool retries suppress the final result"
     Under all three strategies, if any function (or unknown) tool in a batch produces a [`RetryPromptPart`][pydantic_ai.messages.RetryPromptPart] (via [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] or argument-validation errors), the final result is suppressed and the retry surfaces to the model on the next round — the **retry-wins** invariant. The output tool's return part is rewritten to indicate the suppression.

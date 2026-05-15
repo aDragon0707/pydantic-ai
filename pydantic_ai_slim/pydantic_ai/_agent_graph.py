@@ -916,8 +916,30 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
 
         # Merge possible consecutive trailing `ModelRequest`s into one, with tool call parts before user parts,
         # but don't store it in the message history on state. This is just for the benefit of model classes that want clear user/assistant boundaries.
-        # See `tests/test_tools.py::test_parallel_tool_return_with_deferred` for an example where this is necessary
+        # See `tests/test_tools.py::test_parallel_tool_return_with_deferred` for an example where this is necessary.
+        #
+        # Run a first pass so `prepare_messages` sees a normalized history.
         messages = _clean_message_history(messages)
+
+        # Hand off to the model class for any history shapes the active provider can't
+        # ship on the wire — currently typed `NativeToolSearch*Part` instances translated
+        # to local-shape `ToolSearch*Part` when the profile doesn't support `ToolSearchTool`.
+        #
+        # Lives on `Model.prepare_messages` rather than inline here for two reasons:
+        # 1. The translation depends on `self.profile`, which is per-model state.
+        # 2. `FallbackModel` defers the decision until it's picked an underlying model — so
+        #    each candidate runs `prepare_messages` itself with its own profile when chosen.
+        prepared = model.prepare_messages(messages)
+
+        # If `prepare_messages` produced a new list (e.g. tool-search synthesis split a
+        # `ModelResponse(call+return)` into `ModelResponse(call) + ModelRequest(return)`
+        # adjacent to an existing `ModelRequest`), re-run cleanup so consecutive same-role
+        # messages are merged. The default `prepare_messages` returns the input list
+        # unchanged, so the identity check skips the redundant second pass.
+        if prepared is not messages:
+            messages = _clean_message_history(prepared)
+        else:
+            messages = prepared
 
         ctx.state.last_max_tokens = model_settings.get('max_tokens') if model_settings else None
         ctx.state.last_model_request_parameters = model_request_parameters
@@ -1667,11 +1689,15 @@ async def process_tool_calls(  # noqa: C901
         # Split executable calls into segments by `sequential=True` barrier tools.
         # Each non-barrier tool joins the current parallel group; each barrier tool is its
         # own group of length 1.
+        #
+        # `ToolManager.parallel_execution_mode('sequential')` is an explicit opt-in for the
+        # whole run; honor it by treating *every* call as its own one-tool segment.
+        global_sequential = tool_manager.get_parallel_execution_mode(tool_calls) == 'sequential'
         segments: list[list[int]] = []
         current: list[int] = []
         for i in executable_indices:
             tool_def = tool_manager.get_tool_def(tool_calls[i].tool_name)
-            is_barrier = bool(tool_def is not None and tool_def.sequential)
+            is_barrier = global_sequential or bool(tool_def is not None and tool_def.sequential)
             if is_barrier:
                 if current:
                     segments.append(current)
@@ -1832,6 +1858,10 @@ async def process_tool_calls(  # noqa: C901
                                 user_parts_by_index[i] = _messages.UserPromptPart(content=tool_user_content)
                             if isinstance(tool_part, _messages.RetryPromptPart):
                                 retry_wins_triggered = True
+                            # `FunctionToolResultEvent`s stream in *completion* order for
+                            # low-latency progress reporting. The `output_parts` written
+                            # below are appended in *emission* order so the message history
+                            # stays stable regardless of which task finished first.
                             yield _messages.FunctionToolResultEvent(tool_part, content=tool_user_content)
 
                     # Early-strategy cancellation: if the first-emission-order output has

@@ -155,10 +155,13 @@ class ToolManager(Generic[AgentDepsT]):
     def get_parallel_execution_mode(self, calls: list[ToolCallPart]) -> ParallelExecutionMode:
         """Get the effective parallel execution mode for a list of tool calls.
 
-        Returns the value of the `parallel_execution_mode` context variable. Per-tool
-        `sequential=True` is *not* honored here — it is handled at the
-        `process_tool_calls` level as a barrier between parallel segments rather than
-        forcing the whole batch to run serially.
+        Returns the value of the `parallel_execution_mode` context variable. When set to
+        `'sequential'` (e.g. via [`ToolManager.parallel_execution_mode`][pydantic_ai.tool_manager.ToolManager.parallel_execution_mode]
+        as an explicit opt-in for the whole run), `process_tool_calls` runs every tool
+        as its own barrier — equivalent to marking every tool `sequential=True`.
+
+        Per-tool `sequential=True` (the more common case) is *not* surfaced through this
+        method; it is enforced as a per-call barrier inside `process_tool_calls`.
         """
         return _parallel_execution_mode_ctx_var.get()
 
