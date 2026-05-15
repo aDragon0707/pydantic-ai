@@ -4798,7 +4798,7 @@ class TestMultipleToolCalls:
         # The first output tool's result wins; both processors ran in parallel.
         assert isinstance(result.output, OutputType)
         assert result.output.value == 'first'
-        assert output_tools_called == ['first', 'second']
+        assert sorted(output_tools_called) == ['first', 'second']
 
         # Verify message-history bookkeeping reflects the skipped second output.
         last_request = result.all_messages()[-1]
@@ -5132,7 +5132,7 @@ class TestMultipleToolCalls:
         assert result.output.value == 'first'
 
         # Verify both output tools were called
-        assert output_tools_called == ['first', 'second']
+        assert sorted(output_tools_called) == ['first', 'second']
 
         # Verify we got tool returns in the correct order
         assert result.all_messages() == snapshot(
@@ -5219,7 +5219,7 @@ class TestMultipleToolCalls:
         # surfaced to message history but doesn't trigger retry-wins.
         assert isinstance(result.output, OutputType)
         assert result.output.value == 'valid'
-        assert output_tools_called == ['first', 'second']
+        assert sorted(output_tools_called) == ['first', 'second']
 
         last_request = result.all_messages()[-1]
         assert isinstance(last_request, ModelRequest)
@@ -5273,7 +5273,7 @@ class TestMultipleToolCalls:
         assert result.output.value == 'valid'
 
         # Verify both output tools were called
-        assert output_tools_called == ['first', 'second']
+        assert sorted(output_tools_called) == ['first', 'second']
 
         # Verify we got appropriate messages
         assert result.all_messages() == snapshot(
@@ -5357,7 +5357,7 @@ class TestMultipleToolCalls:
         assert result.output.value == 'valid'
 
         # Verify both output tools were called
-        assert output_tools_called == ['first', 'second']
+        assert sorted(output_tools_called) == ['first', 'second']
 
         # Verify we got appropriate messages
         assert result.all_messages() == snapshot(

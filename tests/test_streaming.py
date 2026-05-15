@@ -2353,7 +2353,7 @@ class TestMultipleToolCalls:
         assert response.value == 'first'
 
         # Verify both output tools were called
-        assert output_tools_called == ['first', 'second']
+        assert sorted(output_tools_called) == ['first', 'second']
 
         # Verify we got tool returns in the correct order
         assert result.all_messages() == snapshot(
@@ -2433,8 +2433,8 @@ class TestMultipleToolCalls:
         assert isinstance(response, OutputType)
         assert response.value == snapshot('valid')
 
-        # Verify both output tools were called
-        assert output_tools_called == snapshot(['first', 'second'])
+        # Verify both output tools were called (parallel execution: order is not guaranteed)
+        assert sorted(output_tools_called) == snapshot(['first', 'second'])
 
         # Verify we got appropriate messages
         assert result.all_messages() == snapshot(
@@ -2566,7 +2566,7 @@ class TestMultipleToolCalls:
         assert response.value == 'valid'
 
         # Verify both output tools were called
-        assert output_tools_called == ['first', 'second']
+        assert sorted(output_tools_called) == ['first', 'second']
 
         # Verify we got appropriate messages
         assert result.all_messages() == snapshot(
@@ -2704,8 +2704,8 @@ class TestMultipleToolCalls:
             ]
         )
 
-    async def test_exhaustive_strategy_runs_function_tools_around_output_in_emission_order(self):
-        """Function tools surrounding an output tool execute in the order the model emitted them."""
+    async def test_exhaustive_strategy_function_tool_returns_preserve_emission_order_around_output(self):
+        """Function tool returns appear in the response message in emission order, even though execution is parallel."""
         execution_order: list[str] = []
 
         async def sf(_: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str | DeltaToolCalls]:
@@ -2724,7 +2724,8 @@ class TestMultipleToolCalls:
         async with agent.run_stream('test') as result:
             response = await result.get_output()
 
-        assert execution_order == ['before', 'after']
+        # Both function tools execute in parallel — order is not guaranteed.
+        assert sorted(execution_order) == ['after', 'before']
         assert isinstance(response, OutputType)
         assert response.value == 'done'
 
