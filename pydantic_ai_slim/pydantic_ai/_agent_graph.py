@@ -1454,24 +1454,6 @@ def _emit_output_tool_events(
     yield _messages.OutputToolResultEvent(part)
 
 
-def _emit_legacy_output_tool_function_events(
-    call: _messages.ToolCallPart,
-    part: _messages.ToolReturnPart | _messages.RetryPromptPart,
-    *,
-    args_valid: bool | None,
-) -> Iterator[_messages.HandleResponseEvent]:
-    """Yield legacy `FunctionToolCallEvent` / `FunctionToolResultEvent` for an output tool call.
-
-    These keep firing on output-tool failure paths (skipped, validation/execution failure triggering
-    a retry) for backward compatibility, so consumers matching the legacy event types still see them.
-    They will stop firing in v2; users should match `OutputToolCallEvent` / `OutputToolResultEvent`
-    (or the shared `ToolCallEvent` / `ToolResultEvent` bases) instead. No runtime warning is fired
-    so that already-migrated consumers don't see noise on every output-tool retry.
-    """
-    yield _messages.FunctionToolCallEvent(call, args_valid=args_valid)
-    yield _messages.FunctionToolResultEvent(part)
-
-
 @dataclasses.dataclass
 class _OutputCallResult(Generic[NodeRunEndT]):
     """Result of running an output-tool task in `process_tool_calls`.
@@ -1657,8 +1639,6 @@ async def process_tool_calls(  # noqa: C901
                     call, 'Output tool not used - a final result was already processed.', output_parts
                 )
                 for event in _emit_output_tool_events(call, part, args_valid=None):
-                    yield event
-                for event in _emit_legacy_output_tool_function_events(call, part, args_valid=None):
                     yield event
             else:
                 output_parts.append(
@@ -1941,8 +1921,6 @@ async def process_tool_calls(  # noqa: C901
                     )
                     for event in _emit_output_tool_events(call, part, args_valid=None):
                         yield event
-                    for event in _emit_legacy_output_tool_function_events(call, part, args_valid=None):
-                        yield event
                     continue
                 if r.final_result is not None:
                     is_winner = final_result is not None and final_result.tool_call_id == call.tool_call_id
@@ -1971,8 +1949,6 @@ async def process_tool_calls(  # noqa: C901
                         )
                         for event in _emit_output_tool_events(call, part, args_valid=None):
                             yield event
-                        for event in _emit_legacy_output_tool_function_events(call, part, args_valid=None):
-                            yield event
                 elif r.raise_exc is not None:
                     # The error was absorbed (another output succeeded). Stub as skipped.
                     # We can distinguish validation vs execution failure by `args_valid`.
@@ -1984,14 +1960,10 @@ async def process_tool_calls(  # noqa: C901
                     part = _make_output_status_part(call, skip_message, output_parts)
                     for event in _emit_output_tool_events(call, part, args_valid=r.args_valid):
                         yield event
-                    for event in _emit_legacy_output_tool_function_events(call, part, args_valid=r.args_valid):
-                        yield event
                 else:
                     assert r.retry_part is not None
                     output_parts.append(r.retry_part)
                     for event in _emit_output_tool_events(call, r.retry_part, args_valid=r.args_valid):
-                        yield event
-                    for event in _emit_legacy_output_tool_function_events(call, r.retry_part, args_valid=r.args_valid):
                         yield event
             elif i in return_parts_by_index:
                 output_parts.append(return_parts_by_index[i])
