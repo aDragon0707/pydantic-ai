@@ -2052,13 +2052,20 @@ async def process_tool_calls(  # noqa: C901
         and final_result is not None
         and not isinstance(final_result.output, _output.DeferredToolRequests)
     ):
-        # `stubbed_ids` deduplicates across the two sources (`upfront_deferred_calls` and
-        # `deferred_calls`). Defensive against the same tool_call_id appearing in both lists;
-        # in practice they're disjoint because upfront-classified-deferred calls never reach
-        # the execution loop that populates `deferred_calls` mid-flight.
-        stubbed_ids: set[str] = set()
+        # `upfront_deferred_calls` (external/unapproved kinds classified up-front) and
+        # `deferred_calls.values()` (function tools that raised ApprovalRequired/CallDeferred
+        # mid-execution) are disjoint by construction — a call is one kind or the other, not
+        # both. So we can append from each source without deduplication.
         for call in upfront_deferred_calls:
-            if call.tool_call_id not in stubbed_ids:  # pragma: no branch
+            output_parts.append(
+                _messages.ToolReturnPart(
+                    tool_name=call.tool_name,
+                    content='Tool not executed - a final result was already processed.',
+                    tool_call_id=call.tool_call_id,
+                )
+            )
+        for kind_calls in deferred_calls.values():
+            for call in kind_calls:
                 output_parts.append(
                     _messages.ToolReturnPart(
                         tool_name=call.tool_name,
@@ -2066,20 +2073,6 @@ async def process_tool_calls(  # noqa: C901
                         tool_call_id=call.tool_call_id,
                     )
                 )
-                stubbed_ids.add(call.tool_call_id)
-        for kind_calls in (
-            deferred_calls.values()
-        ):  # pragma: no cover  # mid-execution deferred + final_result is a near-impossible race; defensive only
-            for call in kind_calls:
-                if call.tool_call_id not in stubbed_ids:
-                    output_parts.append(
-                        _messages.ToolReturnPart(
-                            tool_name=call.tool_name,
-                            content='Tool not executed - a final result was already processed.',
-                            tool_call_id=call.tool_call_id,
-                        )
-                    )
-                    stubbed_ids.add(call.tool_call_id)
 
     if (
         tool_call_results is None
@@ -2231,12 +2224,17 @@ async def _call_tools(
     ]
     try:
         pending: set[
-            asyncio.Task[tuple[_messages.ToolReturnPart | _messages.RetryPromptPart, _messages.UserPromptPart | None]]
-        ] = set(tasks)  # pyright: ignore[reportAssignmentType]
+            asyncio.Task[
+                tuple[
+                    _messages.ToolReturnPart | _messages.RetryPromptPart,
+                    str | Sequence[_messages.UserContent] | None,
+                ]
+            ]
+        ] = set(tasks)
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
-                index = tasks.index(task)  # pyright: ignore[reportArgumentType]
+                index = tasks.index(task)
                 try:
                     tool_part, tool_user_content = task.result()
                 except exceptions.CallDeferred as e:

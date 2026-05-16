@@ -4440,6 +4440,40 @@ class TestMultipleToolCalls:
         assert 'barrier' not in execution_log
         assert 'after' not in execution_log
 
+    def test_graceful_strategy_stubs_mid_execution_deferred_when_output_wins(self):
+        """A function tool that raises `ApprovalRequired` mid-execution alongside a
+        successful output tool is stubbed in the message history as "not executed",
+        rather than surfaced as a fresh approval request to the next round."""
+        from pydantic_ai.exceptions import ApprovalRequired
+
+        def maybe_approve(ctx: RunContext[None], x: int) -> int:
+            if not ctx.tool_call_approved:
+                raise ApprovalRequired
+            return x  # pragma: no cover
+
+        def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            assert info.output_tools is not None
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('maybe_approve', {'x': 1}),
+                    ToolCallPart('final_result', {'value': 'done'}),
+                ],
+            )
+
+        agent = Agent(FunctionModel(return_model), output_type=OutputType, end_strategy='graceful')
+        agent.tool(maybe_approve)
+
+        result = agent.run_sync('test mid-execution deferred + output wins')
+
+        assert isinstance(result.output, OutputType)
+        assert result.output.value == 'done'
+
+        last_request = result.all_messages()[-1]
+        assert isinstance(last_request, ModelRequest)
+        return_parts = [p for p in last_request.parts if isinstance(p, ToolReturnPart)]
+        maybe_approve_part = next(p for p in return_parts if p.tool_name == 'maybe_approve')
+        assert maybe_approve_part.content == 'Tool not executed - a final result was already processed.'
+
     def test_early_strategy_with_external_tool_call(self):
         """Test that early strategy handles external tool calls correctly.
 
