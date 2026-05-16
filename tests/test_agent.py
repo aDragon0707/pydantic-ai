@@ -5845,6 +5845,56 @@ class TestMultipleToolCalls:
         # The retry from `edit` is also present.
         assert any(isinstance(part, RetryPromptPart) and part.tool_name == 'edit' for part in first_round_request.parts)
 
+    def test_exhaustive_retry_wins_with_function_tool_retry_emitted_before_output(self):
+        """Retry-wins fires regardless of emission order: the suppression loop walks past
+        the function tool's `RetryPromptPart` to find and rewrite the output tool's return."""
+        call_count = 0
+
+        def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            nonlocal call_count
+            call_count += 1
+            assert info.output_tools is not None
+            if call_count == 1:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart('edit', {'text': 'NONEXISTENT'}),
+                        ToolCallPart('final_result', {'value': 'finished'}),
+                    ],
+                )
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('edit', {'text': 'CORRECT'}),
+                    ToolCallPart('final_result', {'value': 'finished'}),
+                ]
+            )
+
+        agent = Agent(FunctionModel(return_model), output_type=OutputType, end_strategy='exhaustive')
+
+        @agent.tool_plain
+        def edit(text: str) -> str:
+            if text == 'NONEXISTENT':
+                raise ModelRetry('Anchor not found.')
+            return f'Edited: {text}'
+
+        result = agent.run_sync('test retry-wins with function tool emitted before output')
+
+        assert isinstance(result.output, OutputType)
+        assert result.output.value == 'finished'
+        assert call_count == 2
+
+        messages = result.all_messages()
+        first_round_request = messages[2]
+        assert isinstance(first_round_request, ModelRequest)
+        # The first part is the `RetryPromptPart` (emission order); the second is the
+        # rewritten output-tool `ToolReturnPart`.
+        suppressed_returns = [
+            part
+            for part in first_round_request.parts
+            if isinstance(part, ToolReturnPart) and part.tool_name == 'final_result'
+        ]
+        assert len(suppressed_returns) == 1
+        assert suppressed_returns[0].content == 'Output not used as the final result.'
+
     def test_graceful_retry_wins_suppresses_final_result_on_function_tool_retry(self):
         """Retry-wins fires under `graceful` too: a function tool's `ModelRetry` suppresses
         `final_result` even though `graceful` would normally still execute function tools."""
